@@ -1,19 +1,29 @@
-# Sarvam AI STT & TTS
+# Web framework and server
+fastapi>=0.115.0
+uvicorn>=0.22.0
+python-multipart>=0.0.9
+
+# HTTP & configuration
+httpx>=0.25.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# Redis & memory management
+redis>=5.0.0
+redisvl>=0.2.0
+agent-memory-client>=0.14.0
+numpy>=1.26.0
+
+# Sarvam AI + audio
 sarvamai>=0.1.0
 pyaudio>=0.2.14
 
-# Redis Agent Memory Server
-agent-memory-client>=0.14.0
-redis>=5.0.0
-python-dotenv>=1.0.0
-httpx>=0.25.0
-pydantic>=2.0.0
+# Google Calendar
+google-api-python-client>=2.100.0
+google-auth>=2.20.0
+google-auth-oauthlib>=1.0.0
+google-auth-httplib2>=0.1.0
 
 # Testing
 pytest>=7.0.0
 pytest-asyncio>=0.23.0
-
-# Note: Requires Python 3.10+
-# Agent Memory Server runs via Docker:
-# docker run -p 8001:8000 -e REDIS_URL=... -e OPENAI_API_KEY=... redislabs/agent-memory-server:latest
-

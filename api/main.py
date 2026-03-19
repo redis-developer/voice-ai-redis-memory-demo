@@ -29,9 +29,11 @@ from src.journal_manager import JournalManager
 from src.analytics import JournalAnalytics
 from src.memory_client import MemoryClient
 from src.voice_agent import VoiceJournalAgent
+from src.calendar_client import CalendarClient
 
 # Global clients
 memory_client: Optional[MemoryClient] = None
+calendar_client: Optional[CalendarClient] = None
 agents: Dict[str, VoiceJournalAgent] = {}  # (user_id, session_id) -> agent
 
 @asynccontextmanager
@@ -55,9 +57,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Voice Journal API", version="1.0.0", lifespan=lifespan)
 
 # CORS for frontend
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=cors_origins or ["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -494,8 +502,8 @@ async def agent_chat(request: AgentChatRequest):
             except Exception as e2:
                 logger.error(f"TTS fallback also failed: {e2}")
 
-        # Get current entry count
-        entry_count = agent.store.get_entry_count(request.user_id)
+        # Entry count not tracked (store removed)
+        entry_count = 0
 
         # Infer intent from mode (semantic router already detected it in process_input)
         intent_str = agent.state.mode.value  # "log" or "chat"
@@ -566,7 +574,7 @@ async def agent_chat_stream(request: AgentChatRequest):
 
     # Get agent response (text only)
     response_text, _ = await agent.process_input(text)
-    entry_count = agent.store.get_entry_count(request.user_id)
+    entry_count = 0  # Entry count not tracked (store removed)
     intent_str = agent.state.mode.value
 
     async def generate_stream():
@@ -621,4 +629,60 @@ def set_agent_mode(user_id: str = "default_user", session_id: str = "default_ses
     return {"mode": agent.get_mode(), "user_id": user_id}
 
 
+# Calendar API
+class CalendarEvent(BaseModel):
+    """Calendar event response model."""
+    summary: str
+    start_time: str
+    end_time: Optional[str] = None
+    location: Optional[str] = None
+    is_all_day: bool = False
 
+
+@app.get("/api/calendar/today", response_model=List[CalendarEvent])
+async def get_today_events():
+    """Get today's calendar events."""
+    global calendar_client
+
+    try:
+        if calendar_client is None:
+            calendar_client = CalendarClient()
+
+        events = calendar_client.get_today_events()
+
+        result = []
+        for event in events:
+            start = event.get("start")
+            end = event.get("end")
+
+            # Format time
+            if event.get("is_all_day"):
+                start_time = "All day"
+                end_time = None
+            else:
+                if hasattr(start, "strftime"):
+                    start_time = start.strftime("%I:%M %p").lstrip("0")
+                else:
+                    start_time = str(start)
+
+                if end and hasattr(end, "strftime"):
+                    end_time = end.strftime("%I:%M %p").lstrip("0")
+                else:
+                    end_time = None
+
+            result.append(CalendarEvent(
+                summary=event.get("summary", "Untitled"),
+                start_time=start_time,
+                end_time=end_time,
+                location=event.get("location"),
+                is_all_day=event.get("is_all_day", False)
+            ))
+
+        return result
+
+    except FileNotFoundError as e:
+        logger.warning(f"Calendar credentials not found: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Calendar error: {e}")
+        return []

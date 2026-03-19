@@ -1,0 +1,51 @@
+services:
+  memory-server:
+    image: redislabs/agent-memory-server:latest
+    container_name: voice-journal-memory-server
+    command: ["agent-memory", "api", "--host", "0.0.0.0", "--port", "8000", "--task-backend", "asyncio"]
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      REDIS_URL: ${REDIS_URL:?REDIS_URL must be set}
+      GENERATION_MODEL: ${MEMORY_SERVER_GENERATION_MODEL:-gpt-4o-mini}
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/openapi.json')"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: voice-journal-backend
+    env_file:
+      - .env
+    environment:
+      MEMORY_SERVER_URL: ${MEMORY_SERVER_URL:-http://memory-server:8000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8080:8080"
+    depends_on:
+      memory-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
+    container_name: voice-journal-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped

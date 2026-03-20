@@ -21,12 +21,18 @@ Voice-first journaling app that demonstrates how Redis Agent Memory Server can p
   - [2. Environment Configuration](#2-environment-configuration)
   - [3. Start Agent Memory Server](#3-start-agent-memory-server)
   - [4. Run with Docker](#4-run-with-docker)
-- [5. Run for Development](#5-run-for-development)
+  - [5. Run for Development](#5-run-for-development)
 - [Google Calendar Setup](#google-calendar-setup)
+- [Screenshots](#screenshots)
 - [Architecture](#architecture)
+  - [Architecture Flow](#architecture-flow)
 - [Project Structure](#project-structure)
 - [Usage](#usage)
+- [Docker Commands Reference](#docker-commands-reference)
+- [Cloud Deployment](#cloud-deployment)
 - [Resources](#resources)
+- [Maintainers](#maintainers)
+- [License](#license)
 
 ## Demo Objectives
 
@@ -168,6 +174,10 @@ Calendar support is optional and uses Google Calendar API OAuth, not an iCal URL
 
 If `credentials.json` or `token.json` is missing, the calendar API returns an empty list and the rest of the app still works.
 
+## Screenshots
+
+![Voice Journal App](assets/app-screenshot.png)
+
 ## Architecture
 
 ```mermaid
@@ -185,7 +195,7 @@ flowchart LR
     TTS --> FE
 ```
 
-### Runtime Flow
+### Architecture Flow
 
 1. The frontend captures typed or recorded input and sends it to FastAPI.
 2. The backend transcribes audio with Sarvam when needed.
@@ -232,6 +242,33 @@ voice_ai_redis_memory_demo/
 4. Reuse the same chat session to benefit from working memory continuity.
 5. Review the sidebar schedule and journal feed in the frontend.
 
+## Docker Commands Reference
+
+Use these Compose commands for the local container workflow:
+
+```bash
+docker compose up --build
+docker compose up -d
+docker compose logs -f backend
+docker compose logs -f frontend
+docker compose logs -f memory-server
+docker compose down
+```
+
+If you update frontend environment values such as `NEXT_PUBLIC_API_URL`, rebuild the frontend image so the new value is baked into the Next.js bundle.
+
+## Cloud Deployment
+
+This repository currently documents local development and Docker Compose deployment only.
+
+Unlike the reference dealership demo, this project does not yet include a `terraform/` directory or a cloud deployment guide. If you want to deploy it to a cloud VM or container platform, the main pieces to externalize are:
+
+- a Redis instance reachable by the Agent Memory Server
+- the Agent Memory Server service
+- the FastAPI backend service
+- the Next.js frontend with the correct `NEXT_PUBLIC_API_URL`
+- secrets for Sarvam, OpenAI, and optional Google Calendar OAuth credentials
+
 ## Resources
 
 - [Redis Agent Memory Server](https://github.com/redis/agent-memory-server)
@@ -239,3 +276,11 @@ voice_ai_redis_memory_demo/
 - [RedisVL](https://redis.io/docs/latest/develop/ai/redisvl/)
 - [FastAPI](https://fastapi.tiangolo.com/)
 - [Next.js](https://nextjs.org/docs)
+
+## Maintainers
+
+- **Bhavana Giri** — [@bhavana-giri](https://github.com/bhavana-giri)
+
+## License
+
+This repository does not currently include a top-level `LICENSE` file. Add one before redistributing the project if you need explicit license terms.

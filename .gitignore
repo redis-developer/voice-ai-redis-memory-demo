@@ -12,6 +12,7 @@ token.json
 # Markdown files (except README)
 *.md
 !README.md
+!AWS_DEPLOYMENT.md
 
 # Python
 __pycache__/
@@ -57,3 +58,11 @@ node_modules/
 *.temp
 /tmp/
 
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+crash.log

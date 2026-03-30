@@ -1,6 +1,8 @@
 'use client';
 
-import { useState, useRef, useEffect, useMemo } from 'react';
+import { useState, useRef, useEffect } from 'react';
+import { createRequestId, logLatencyTrace, markTime } from '@/lib/latency';
+import { getAuthHeaders } from '@/lib/userId';
 
 interface Message {
   id: string;
@@ -77,8 +79,6 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
   const [mode, setMode] = useState<'log' | 'chat'>('chat');
   const [entryCount, setEntryCount] = useState(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
 
   // Web Audio API refs for WAV recording
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -90,9 +90,11 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const sendMessage = async (text: string, audioBase64?: string) => {
+  const sendMessage = async (text: string, audioBase64?: string, initialTimings: Record<string, number> = {}) => {
     if (!text.trim() && !audioBase64) return;
 
+    const requestId = createRequestId('chat');
+    const timings = { ...initialTimings };
     const userMessage: Message = {
       id: Date.now().toString(),
       role: 'user',
@@ -105,19 +107,25 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
 
     try {
       // Use streaming endpoint for faster audio playback
+      markTime(timings, 'request_sent');
       const response = await fetch(`${API_BASE_URL}/api/agent/chat/stream`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Request-ID': requestId,
+          ...getAuthHeaders(),
+        },
         body: JSON.stringify({
           text: text || undefined,
           audio_base64: audioBase64,
-          user_id: 'default_user',
           session_id: sessionId
         })
       });
+      markTime(timings, 'response_headers');
 
       if (!response.ok) {
-        throw new Error(`HTTP error: ${response.status}`);
+        const detail = (await response.text()).trim();
+        throw new Error(detail || `HTTP error: ${response.status}`);
       }
 
       const reader = response.body?.getReader();
@@ -132,6 +140,9 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
       let audio: HTMLAudioElement | null = null;
       let audioQueue: Uint8Array[] = [];
       let isSourceOpen = false;
+      let firstAudioChunkSeen = false;
+      let backendMetadata: Record<string, unknown> | null = null;
+      let backendDone: Record<string, unknown> | null = null;
 
       const initMediaSource = () => {
         mediaSource = new MediaSource();
@@ -165,6 +176,10 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
       };
 
       const appendAudioChunk = (chunk: Uint8Array) => {
+        if (!firstAudioChunkSeen) {
+          firstAudioChunkSeen = true;
+          markTime(timings, 'first_audio_chunk');
+        }
         if (!mediaSource) {
           initMediaSource();
         }
@@ -174,7 +189,13 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
             sourceBuffer.appendBuffer(new Uint8Array(chunk).buffer as ArrayBuffer);
             // Start playback after first chunk
             if (audio && audio.paused) {
-              audio.play().catch(console.error);
+              audio.play()
+                .then(() => {
+                  if (timings.audio_playback_started === undefined) {
+                    markTime(timings, 'audio_playback_started');
+                  }
+                })
+                .catch(console.error);
             }
           } catch (e) {
             audioQueue.push(chunk);
@@ -210,6 +231,8 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
             try {
               const msg = JSON.parse(line);
               if (msg.type === 'metadata') {
+                markTime(timings, 'stream_metadata');
+                backendMetadata = msg;
                 // Update session_id if returned
                 if (msg.session_id && msg.session_id !== sessionId) {
                   setSessionId(msg.session_id);
@@ -225,6 +248,8 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
                 setMode(msg.mode);
                 setEntryCount(msg.entry_count);
               } else if (msg.type === 'done') {
+                markTime(timings, 'stream_done');
+                backendDone = msg;
                 // Signal end of stream to MediaSource
                 const ms = mediaSource as MediaSource | null;
                 if (ms && ms.readyState === 'open') {
@@ -243,6 +268,12 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
                   };
                   endStream();
                 }
+                logLatencyTrace('chat.stream', requestId, timings, {
+                  backendRequestId: backendMetadata?.request_id ?? backendDone?.request_id ?? null,
+                  metadataTimingsMs: backendMetadata?.timings_ms ?? null,
+                  doneTimingsMs: backendDone?.timings_ms ?? null,
+                  hasAudio: Boolean(audioBase64),
+                });
               }
             } catch (e) {
               console.error('Failed to parse message:', line, e);
@@ -252,10 +283,13 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
       }
     } catch (error) {
       console.error('Chat error:', error);
+      markTime(timings, 'request_failed');
+      logLatencyTrace('chat.stream.error', requestId, timings, { hasAudio: Boolean(audioBase64) });
+      const detail = error instanceof Error ? error.message : 'Please try again.';
       setMessages(prev => [...prev, {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: 'Sorry, I had trouble processing that. Please try again.',
+        content: `Sorry, I had trouble processing that. ${detail}`,
         timestamp: new Date()
       }]);
     } finally {
@@ -309,6 +343,8 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
   };
 
   const stopRecording = async () => {
+    const timings: Record<string, number> = {};
+    markTime(timings, 'record_stop');
     setIsRecording(false);
 
     // Stop the processor and stream
@@ -334,6 +370,7 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
     // Convert to WAV
     const sampleRate = audioContextRef.current?.sampleRate || 16000;
     const wavBuffer = encodeWAV(mergedSamples, sampleRate);
+    markTime(timings, 'audio_encoded');
 
     // Convert to base64
     const base64 = btoa(
@@ -347,7 +384,7 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
     }
 
     // Send the WAV audio
-    sendMessage('', base64);
+    sendMessage('', base64, timings);
   };
 
   // Start a new chat session (reset conversation)
@@ -471,4 +508,3 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
     </div>
   );
 }
-

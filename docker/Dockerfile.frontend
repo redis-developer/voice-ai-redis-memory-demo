@@ -3,13 +3,16 @@ FROM node:20-alpine
 WORKDIR /app
 
 ARG NEXT_PUBLIC_API_URL=http://localhost:8080
+ARG NEXT_PUBLIC_GOOGLE_CLIENT_ID
 ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+ENV NEXT_PUBLIC_GOOGLE_CLIENT_ID=${NEXT_PUBLIC_GOOGLE_CLIENT_ID}
 
 COPY frontend/package*.json ./
 RUN npm ci
 
 COPY frontend ./
 
+RUN test -n "$NEXT_PUBLIC_GOOGLE_CLIENT_ID" || (echo "NEXT_PUBLIC_GOOGLE_CLIENT_ID is required for Google Sign-In builds" && exit 1)
 RUN npm run build
 
 EXPOSE 3000

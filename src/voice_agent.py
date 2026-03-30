@@ -18,6 +18,7 @@ from src.intent_detector import Intent, IntentResult
 from src.memory_client import MemoryClient
 from src.calendar_client import CalendarClient
 from src.intent_router import get_intent_router
+from src.observability import now_ms, log_timing, update_request_context
 
 load_dotenv()
 
@@ -83,11 +84,10 @@ class VoiceJournalAgent:
         - "calendar" intent -> fetch calendar + respond
         - "chat" intent -> search journal + respond
         """
-        import time
         import asyncio
 
         # Use semantic router for intent detection
-        intent_start = time.time()
+        intent_start_ms = now_ms()
         try:
             if self._intent_router is None:
                 self._intent_router = get_intent_router()
@@ -104,7 +104,14 @@ class VoiceJournalAgent:
             else:
                 intent, confidence = "chat", 0.5
 
-        logger.debug(f"Intent detection: {time.time() - intent_start:.2f}s -> {intent} ({confidence:.2f})")
+        update_request_context(intent=intent)
+        log_timing(
+            "agent.intent_detection",
+            intent_start_ms,
+            logger_instance=logger,
+            intent=intent,
+            confidence=confidence,
+        )
 
         if intent == "log":
             # Extract content (remove common prefixes)
@@ -152,11 +159,18 @@ class VoiceJournalAgent:
         # Store in long-term memory via memory_client
         try:
             if self.memory_client:
+                write_start_ms = now_ms()
                 await self.memory_client.create_journal_memory(
                     user_id=self.user_id,
                     transcript=content,
                     language_code="en-IN",
                     topics=["journal", "chat_entry"]
+                )
+                log_timing(
+                    "agent.log.memory_write",
+                    write_start_ms,
+                    logger_instance=logger,
+                    transcript_chars=len(content),
                 )
                 return "Got it! I've saved your note. Anything else?"
             else:
@@ -167,7 +181,6 @@ class VoiceJournalAgent:
     
     async def _handle_ask(self, result: IntentResult) -> str:
         """Handle questions about journal entries and calendar."""
-        import time
         import asyncio
         self.state.mode = AgentMode.CHAT
         query = result.entities.get("query", result.original_text)
@@ -180,42 +193,71 @@ class VoiceJournalAgent:
         is_calendar_query = result.entities.get("is_calendar", False)
 
         # Run fetches IN PARALLEL
-        parallel_start = time.time()
+        parallel_start_ms = now_ms()
 
         async def fetch_conversation():
+            fetch_start_ms = now_ms()
             if self.session_id:
                 try:
-                    return await self.memory_client.get_conversation_context(
+                    conversation = await self.memory_client.get_conversation_context(
                         session_id=self.session_id,
                         user_id=self.user_id,
                         max_turns=3
                     )
+                    log_timing(
+                        "agent.fetch_working_memory",
+                        fetch_start_ms,
+                        logger_instance=logger,
+                        chars=len(conversation),
+                    )
+                    return conversation
                 except Exception as e:
                     logger.warning(f"Working memory error: {e}")
+            log_timing("agent.fetch_working_memory", fetch_start_ms, logger_instance=logger, chars=0)
             return ""
 
         async def search_memories():
             # Skip memory search for pure calendar queries (faster)
+            search_start_ms = now_ms()
             if is_calendar_query:
+                log_timing("agent.search_long_term_memory", search_start_ms, logger_instance=logger, skipped=True, results=0)
                 return []
             try:
-                return await self.memory_client.search_long_term_memory(
+                memories = await self.memory_client.search_long_term_memory(
                     query=query,
                     user_id=self.user_id,
                     limit=5,
                     distance_threshold=0.8
                 )
+                log_timing(
+                    "agent.search_long_term_memory",
+                    search_start_ms,
+                    logger_instance=logger,
+                    skipped=False,
+                    results=len(memories),
+                )
+                return memories
             except Exception as e:
                 logger.warning(f"Memory search error: {e}")
+                log_timing("agent.search_long_term_memory", search_start_ms, logger_instance=logger, skipped=False, results=0, error=True)
                 return []
 
         async def fetch_calendar():
+            fetch_start_ms = now_ms()
             if is_calendar_query and self.calendar_client:
                 try:
                     # Run sync calendar API in thread pool to avoid blocking
-                    return await asyncio.to_thread(self.calendar_client.get_calendar_context)
+                    calendar_context = await asyncio.to_thread(self.calendar_client.get_calendar_context)
+                    log_timing(
+                        "agent.fetch_calendar",
+                        fetch_start_ms,
+                        logger_instance=logger,
+                        chars=len(calendar_context),
+                    )
+                    return calendar_context
                 except Exception as e:
                     logger.warning(f"Calendar error: {e}")
+            log_timing("agent.fetch_calendar", fetch_start_ms, logger_instance=logger, chars=0, skipped=not is_calendar_query)
             return ""
 
         # Execute in parallel
@@ -224,14 +266,27 @@ class VoiceJournalAgent:
             search_memories(),
             fetch_calendar()
         )
-        logger.debug(f"Parallel fetch: {time.time() - parallel_start:.2f}s (memories: {len(memories)}, calendar: {bool(calendar_context)})")
+        log_timing(
+            "agent.parallel_fetch_total",
+            parallel_start_ms,
+            logger_instance=logger,
+            memories=len(memories),
+            calendar=bool(calendar_context),
+            conversation_chars=len(conversation_context),
+        )
 
         # Build context - only use top result for speed
         journal_context = self._get_top_memory(memories) if memories else ""
 
-        response_start = time.time()
+        response_start_ms = now_ms()
         response = await self._generate_response(query, journal_context, calendar_context)
-        logger.debug(f"Response (Ollama): {time.time() - response_start:.2f}s")
+        log_timing(
+            "agent.generate_response",
+            response_start_ms,
+            logger_instance=logger,
+            journal_context_chars=len(journal_context),
+            calendar_context_chars=len(calendar_context),
+        )
 
         self.state.last_entries_shown = [m.get("id", "") for m in memories] if memories else []
 
@@ -291,6 +346,7 @@ User question: {query}
 Answer:"""
 
         try:
+            ollama_start_ms = now_ms()
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     f"{OLLAMA_URL}/api/generate",
@@ -303,9 +359,16 @@ Answer:"""
                             "temperature": 0.7
                         }
                     },
-                    timeout=10.0
+                    timeout=30.0
                 )
                 data = response.json()
+                log_timing(
+                    "agent.ollama_round_trip",
+                    ollama_start_ms,
+                    logger_instance=logger,
+                    model=OLLAMA_MODEL,
+                    response_chars=len(data.get("response", "").strip()),
+                )
                 return data.get("response", "").strip()
         except Exception as e:
             logger.error(f"Ollama error: {e}")
@@ -326,4 +389,3 @@ Answer:"""
             self.state.mode = AgentMode.LOG
         elif mode == "chat":
             self.state.mode = AgentMode.CHAT
-

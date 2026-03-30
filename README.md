@@ -110,6 +110,7 @@ For local frontend development, keep `frontend/.env.local` aligned with the back
 
 ```bash
 NEXT_PUBLIC_API_URL=http://localhost:8080
+NEXT_PUBLIC_GOOGLE_CLIENT_ID=your_google_oauth_client_id_here
 ```
 
 ### 3. Start Agent Memory Server
@@ -141,6 +142,8 @@ Services:
 Notes:
 
 - The frontend image bakes in `NEXT_PUBLIC_API_URL` at build time.
+- The frontend image also bakes in `NEXT_PUBLIC_GOOGLE_CLIENT_ID` at build time.
+- Set `NEXT_PUBLIC_GOOGLE_CLIENT_ID` in `.env` before running `docker compose up --build`, even if `GOOGLE_CLIENT_ID` is already set for the backend.
 - The backend container overrides `MEMORY_SERVER_URL` to the Compose service hostname.
 - Ollama is not started by Compose; if it is unavailable, the backend falls back to simpler text responses.
 

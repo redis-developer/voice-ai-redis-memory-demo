@@ -2,6 +2,8 @@
 
 import { useState } from 'react';
 import RecordButton from './RecordButton';
+import { createRequestId, logLatencyTrace, markTime } from '@/lib/latency';
+import { getAuthHeaders } from '@/lib/userId';
 
 interface RecordingModalProps {
   isOpen: boolean;
@@ -20,43 +22,60 @@ export default function RecordingModal({ isOpen, onClose, onSave }: RecordingMod
   const [sessionId, setSessionId] = useState('');
   const [error, setError] = useState('');
 
-  const handleRecordingComplete = async (blob: Blob, dur: number) => {
+  const handleRecordingComplete = async (blob: Blob, dur: number, initialTimings: Record<string, number> = {}) => {
+    const requestId = createRequestId('transcribe');
+    const timings = { ...initialTimings };
     setAudioBlob(blob);
     setDuration(dur);
     setIsTranscribing(true);
     setError('');
+    markTime(timings, 'recording_modal_received');
 
     try {
       // Convert blob to base64
       const reader = new FileReader();
       reader.onloadend = async () => {
+        markTime(timings, 'audio_encoded');
         const base64Audio = (reader.result as string).split(',')[1];
 
         try {
           // Call backend API for transcription + memory storage
+          markTime(timings, 'request_sent');
           const response = await fetch(`${API_BASE_URL}/api/transcribe`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Request-ID': requestId,
+              ...getAuthHeaders(),
+            },
             body: JSON.stringify({
               audio_base64: base64Audio,
               store_in_memory: true,
-              user_id: 'default_user'
             })
           });
+          markTime(timings, 'response_headers');
 
           if (!response.ok) {
             throw new Error(`API error: ${response.status}`);
           }
 
           const data = await response.json();
+          markTime(timings, 'response_parsed');
           setTranscript(data.transcript);
           setLanguageCode(data.language_code);
           setSessionId(data.session_id);
+          logLatencyTrace('recording.transcribe', requestId, timings, {
+            backendRequestId: data.request_id,
+            backendTimingsMs: data.timings_ms,
+            transcriptChars: data.transcript?.length ?? 0,
+          });
 
         } catch (apiError) {
           void apiError;
           setError('Failed to transcribe. Make sure the backend server is running.');
           setTranscript('');
+          markTime(timings, 'request_failed');
+          logLatencyTrace('recording.transcribe.error', requestId, timings);
         } finally {
           setIsTranscribing(false);
         }
@@ -202,4 +221,3 @@ export default function RecordingModal({ isOpen, onClose, onSave }: RecordingMod
     </div>
   );
 }
-

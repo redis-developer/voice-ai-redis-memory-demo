@@ -5,14 +5,18 @@ import base64
 import tempfile
 import subprocess
 import asyncio
+import logging
 from datetime import datetime
 from typing import Optional, Tuple, AsyncGenerator
 import pyaudio
 from sarvamai import SarvamAI, AsyncSarvamAI, AudioOutput, EventResponse
 from sarvamai.core.api_error import ApiError
 from dotenv import load_dotenv
+from src.observability import now_ms, log_timing
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 class AudioHandler:
@@ -161,8 +165,7 @@ class AudioHandler:
         Yields:
             Audio bytes chunks (MP3 format)
         """
-        import time
-        t0 = time.time()
+        t0 = now_ms()
         first_chunk = True
         chunk_count = 0
 
@@ -192,20 +195,20 @@ class AudioHandler:
                         chunk = base64.b64decode(message.data.audio)
                         chunk_count += 1
                         if first_chunk:
-                            print(f"[TIMING] TTS first chunk: {time.time() - t0:.2f}s")
+                            log_timing("audio.tts_stream.first_chunk", t0, logger_instance=logger, chunks=chunk_count)
                             first_chunk = False
                         yield chunk
                     elif isinstance(message, EventResponse):
                         # This is the completion signal - break the loop
                         if hasattr(message, 'data') and hasattr(message.data, 'event_type'):
                             if message.data.event_type == "final":
-                                print(f"[TTS Stream] Received final event")
+                                logger.info("TTS stream received final event")
                                 break
 
-                print(f"[TIMING] TTS stream complete: {chunk_count} chunks in {time.time() - t0:.2f}s")
+                log_timing("audio.tts_stream.complete", t0, logger_instance=logger, chunks=chunk_count)
 
         except Exception as e:
-            print(f"[TTS Stream] Error: {e}")
+            logger.warning(f"TTS stream error: {e}")
             # Fall back to non-streaming TTS
             audio = self.text_to_speech(text, language_code, speaker)
             yield audio
@@ -223,16 +226,15 @@ class AudioHandler:
         Uses streaming for faster time-to-first-byte, but collects
         all chunks and returns complete audio.
         """
-        import time
-        t0 = time.time()
+        t0 = now_ms()
         chunks = []
 
         try:
             async for chunk in self.text_to_speech_stream(text, language_code, speaker):
                 chunks.append(chunk)
                 # Check timeout after each chunk
-                if time.time() - t0 > timeout:
-                    print(f"[TTS Stream] Timeout after {timeout}s with {len(chunks)} chunks")
+                if (now_ms() - t0) / 1000.0 > timeout:
+                    logger.warning(f"TTS stream timeout after {timeout}s with {len(chunks)} chunks")
                     break
 
             if chunks:
@@ -242,7 +244,7 @@ class AudioHandler:
                 raise Exception("No audio chunks received")
 
         except Exception as e:
-            print(f"[TTS Stream] Error: {e}, falling back to REST API")
+            logger.warning(f"TTS stream full error: {e}, falling back to REST API")
             return self.text_to_speech(text, language_code, speaker)
 
     async def transcribe_stream(
@@ -264,9 +266,8 @@ class AudioHandler:
         Returns:
             Tuple of (transcript, language_code)
         """
-        import time
         import asyncio
-        t0 = time.time()
+        t0 = now_ms()
 
         # Read and encode audio file
         with open(audio_file, "rb") as f:
@@ -296,13 +297,13 @@ class AudioHandler:
                 # Force immediate processing
                 await ws.flush()
 
-                print(f"[TIMING] STT audio sent: {time.time() - t0:.2f}s")
+                log_timing("audio.stt_stream.audio_sent", t0, logger_instance=logger)
 
                 # Use async for iteration with timeout protection
                 # This prevents hanging on empty/silent audio
                 async def receive_transcript():
                     async for message in ws:
-                        print(f"[TIMING] STT response received: {time.time() - t0:.2f}s")
+                        log_timing("audio.stt_stream.response_received", t0, logger_instance=logger)
 
                         # Extract transcript from response
                         # Response has: type='data', data.transcript='...'
@@ -319,11 +320,11 @@ class AudioHandler:
                         return result
                     raise Exception("Empty transcript received")
                 except asyncio.TimeoutError:
-                    print(f"[STT Stream] Timeout after {timeout}s - no speech detected")
+                    logger.warning(f"STT stream timeout after {timeout}s - no speech detected")
                     raise Exception("STT timeout - no speech detected in audio")
 
         except Exception as e:
-            print(f"[STT Stream] Error: {e}, falling back to REST API")
+            logger.warning(f"STT stream error: {e}, falling back to REST API")
             # Fall back to non-streaming STT
             transcript, lang_code, _ = self.transcribe(audio_file, mode, language_code)
             return transcript, lang_code
@@ -344,4 +345,3 @@ class AudioHandler:
         finally:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
-

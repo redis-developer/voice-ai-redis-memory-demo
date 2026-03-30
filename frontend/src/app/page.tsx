@@ -1,12 +1,20 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import Sidebar from '@/components/Sidebar';
 import SearchBar from '@/components/SearchBar';
 import EntryCard from '@/components/EntryCard';
 import RecordingModal from '@/components/RecordingModal';
 import ChatInterface from '@/components/ChatInterface';
+import GoogleAuthButton from '@/components/GoogleAuthButton';
 import { JournalEntry, PlaybackState } from '@/types';
+import {
+  AUTH_CHANGE_EVENT,
+  getAuthHeaders,
+  getOrCreateUserId,
+  getStoredGoogleAuthProfile,
+  type GoogleAuthProfile,
+} from '@/lib/userId';
 
 // Mock data for demonstration
 const mockEntries: JournalEntry[] = [
@@ -40,6 +48,9 @@ const mockEntries: JournalEntry[] = [
 ];
 
 export default function Home() {
+  const [userId, setUserId] = useState('default_user');
+  const [authUser, setAuthUser] = useState<GoogleAuthProfile | null>(null);
+  const [authReady, setAuthReady] = useState(false);
   const [activeTab, setActiveTab] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [entries, setEntries] = useState<JournalEntry[]>(mockEntries);
@@ -53,6 +64,65 @@ export default function Home() {
     duration: 0,
     entryId: null,
   });
+
+  useEffect(() => {
+    const syncAuthState = () => {
+      setAuthUser(getStoredGoogleAuthProfile());
+      setUserId(getOrCreateUserId());
+      setAuthReady(true);
+    };
+
+    syncAuthState();
+    window.addEventListener(AUTH_CHANGE_EVENT, syncAuthState);
+
+    return () => {
+      window.removeEventListener(AUTH_CHANGE_EVENT, syncAuthState);
+    };
+  }, []);
+
+  if (!authReady || !authUser) {
+    const heading = authReady ? 'Choose a sign-in method to continue' : 'Sign in to keep your entries separate';
+    const copy = authReady
+      ? 'Sign in with Google to keep your notes and voice memories tied to your account.'
+      : 'Use Google sign-in to sync your identity across devices and keep your journal private.';
+
+    return (
+      <div className="min-h-screen gradient-bg flex items-center justify-center p-6">
+        <div className="w-full max-w-md rounded-3xl border border-white/50 bg-white/85 backdrop-blur-xl p-8 shadow-2xl shadow-purple-500/10">
+          <div className="mb-6 flex items-center gap-3">
+            <div className="w-12 h-12 bg-gradient-to-br from-violet-500 to-purple-600 rounded-2xl flex items-center justify-center shadow-lg shadow-purple-500/25">
+              <span className="text-2xl">🎙️</span>
+            </div>
+            <div>
+              <h1 className="text-2xl font-bold text-gray-800">Voice Journal</h1>
+              <p className="text-sm text-gray-500">{heading}</p>
+            </div>
+          </div>
+
+          <div className="space-y-4">
+            <div className="rounded-2xl bg-purple-50/80 border border-purple-100 p-4">
+              <p className="text-sm text-gray-700">{copy}</p>
+            </div>
+
+            <div className="flex justify-start">
+              <GoogleAuthButton
+                currentUser={authUser}
+                onAuthenticated={(profile) => {
+                  setAuthUser(profile);
+                  setUserId(profile.userId);
+                  setAuthReady(true);
+                }}
+                onSignedOut={() => {
+                  setAuthUser(null);
+                  setUserId(getOrCreateUserId());
+                }}
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const filteredEntries = entries.filter((entry) =>
     entry.transcript.toLowerCase().includes(searchQuery.toLowerCase())
@@ -86,14 +156,17 @@ export default function Home() {
       const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
       const response = await fetch(`${apiUrl}/api/mood`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mood, emoji, user_id: 'default_user' }),
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify({ mood, emoji }),
       });
 
       if (!response.ok) {
         throw new Error('Failed to save mood');
       }
-    } catch (error) {
+    } catch {
       // Silently handle error - UI will reset selected mood
       setSelectedMood(null);
     } finally {
@@ -121,7 +194,13 @@ export default function Home() {
 
   return (
     <div className="flex h-screen gradient-bg">
-      <Sidebar activeTab={activeTab} onTabChange={setActiveTab} />
+      <Sidebar
+        activeTab={activeTab}
+        onTabChange={setActiveTab}
+        userName={authUser?.name || undefined}
+        userEmail={authUser?.email || undefined}
+        userAvatarUrl={authUser?.picture}
+      />
 
       <main className="flex-1 flex flex-col overflow-hidden">
         <header className="p-6 border-b border-gray-200/50">
@@ -130,7 +209,18 @@ export default function Home() {
               <h1 className="text-2xl font-bold text-gray-800">Voice Journal</h1>
               <p className="text-sm text-gray-500">Capture your thoughts with your voice</p>
             </div>
-            <div className="flex gap-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <GoogleAuthButton
+                currentUser={authUser}
+                onAuthenticated={(profile) => {
+                  setAuthUser(profile);
+                  setUserId(profile.userId);
+                }}
+                onSignedOut={() => {
+                  setAuthUser(null);
+                  setUserId(getOrCreateUserId());
+                }}
+              />
               <button
                 onClick={() => setIsChatOpen(true)}
                 className="flex items-center gap-2 px-5 py-3 bg-gradient-to-r from-emerald-500 to-teal-600 rounded-xl text-white font-medium hover:from-emerald-400 hover:to-teal-500 transition-all shadow-lg shadow-teal-500/25"
@@ -199,7 +289,11 @@ export default function Home() {
         </div>
       </main>
 
-      <RecordingModal isOpen={isRecordingModalOpen} onClose={() => setIsRecordingModalOpen(false)} onSave={handleSaveRecording} />
+      <RecordingModal
+        isOpen={isRecordingModalOpen}
+        onClose={() => setIsRecordingModalOpen(false)}
+        onSave={handleSaveRecording}
+      />
       <ChatInterface isOpen={isChatOpen} onClose={() => setIsChatOpen(false)} />
     </div>
   );

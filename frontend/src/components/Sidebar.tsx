@@ -13,6 +13,9 @@ interface CalendarEvent {
 interface SidebarProps {
   activeTab: string;
   onTabChange: (tab: string) => void;
+  userName?: string;
+  userEmail?: string;
+  userAvatarUrl?: string | null;
 }
 
 // Color palette for calendar events
@@ -25,7 +28,7 @@ const eventColors = [
   { border: 'border-teal-400', text: 'text-teal-600' },
 ];
 
-export default function Sidebar({ activeTab, onTabChange }: SidebarProps) {
+export default function Sidebar({ activeTab, onTabChange, userName, userEmail, userAvatarUrl }: SidebarProps) {
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -157,12 +160,16 @@ export default function Sidebar({ activeTab, onTabChange }: SidebarProps) {
       {/* User Profile */}
       <div className="p-4 border-t border-gray-200/50">
         <div className="flex items-center gap-3 px-2">
-          <div className="w-10 h-10 bg-gradient-to-br from-violet-400 to-purple-500 rounded-full flex items-center justify-center text-white font-bold shadow-lg shadow-purple-500/25">
-            U
+          <div className="w-10 h-10 overflow-hidden bg-gradient-to-br from-violet-400 to-purple-500 rounded-full flex items-center justify-center text-white font-bold shadow-lg shadow-purple-500/25">
+            {userAvatarUrl ? (
+              <img src={userAvatarUrl} alt={userName || 'Google user'} className="w-full h-full object-cover" />
+            ) : (
+              <span>{(userName || 'G').charAt(0).toUpperCase()}</span>
+            )}
           </div>
           <div className="flex-1">
-            <p className="text-sm font-medium text-gray-800">User</p>
-            <p className="text-xs text-gray-500">Free Plan</p>
+            <p className="text-sm font-medium text-gray-800">{userName || 'Guest'}</p>
+            <p className="text-xs text-gray-500">{userEmail || 'Sign in with Google'}</p>
           </div>
           <button className="text-gray-400 hover:text-gray-600">⚙️</button>
         </div>
@@ -170,4 +177,3 @@ export default function Sidebar({ activeTab, onTabChange }: SidebarProps) {
     </aside>
   );
 }
-

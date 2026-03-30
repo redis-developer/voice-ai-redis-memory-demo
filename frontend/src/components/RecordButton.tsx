@@ -1,9 +1,10 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
+import { markTime } from '@/lib/latency';
 
 interface RecordButtonProps {
-  onRecordingComplete: (audioBlob: Blob, duration: number) => void;
+  onRecordingComplete: (audioBlob: Blob, duration: number, timings?: Record<string, number>) => void;
   isDisabled?: boolean;
 }
 
@@ -57,6 +58,7 @@ export default function RecordButton({ onRecordingComplete, isDisabled }: Record
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const audioBufferRef = useRef<Float32Array[]>([]);
   const durationRef = useRef(0);
+  const timingsRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
     return () => {
@@ -67,6 +69,8 @@ export default function RecordButton({ onRecordingComplete, isDisabled }: Record
 
   const startRecording = async () => {
     try {
+      timingsRef.current = {};
+      markTime(timingsRef.current, 'record_start');
       // Request 16kHz mono audio for Sarvam AI
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -134,6 +138,7 @@ export default function RecordButton({ onRecordingComplete, isDisabled }: Record
   const stopRecording = async () => {
     if (!isRecording) return;
 
+    markTime(timingsRef.current, 'record_stop');
     setIsRecording(false);
     if (timerRef.current) clearInterval(timerRef.current);
     if (animationRef.current) cancelAnimationFrame(animationRef.current);
@@ -162,9 +167,11 @@ export default function RecordButton({ onRecordingComplete, isDisabled }: Record
     // Convert to WAV
     const sampleRate = audioContextRef.current?.sampleRate || 16000;
     const wavBuffer = encodeWAV(mergedSamples, sampleRate);
+    markTime(timingsRef.current, 'wav_encoded');
 
     // Create WAV blob
     const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+    markTime(timingsRef.current, 'blob_ready');
 
     // Clean up AudioContext
     if (audioContextRef.current) {
@@ -173,7 +180,8 @@ export default function RecordButton({ onRecordingComplete, isDisabled }: Record
     }
 
     // Call completion handler with duration
-    onRecordingComplete(blob, durationRef.current);
+    markTime(timingsRef.current, 'callback_dispatched');
+    onRecordingComplete(blob, durationRef.current, { ...timingsRef.current });
   };
 
   const formatDuration = (seconds: number) => {
@@ -232,4 +240,3 @@ export default function RecordButton({ onRecordingComplete, isDisabled }: Record
     </div>
   );
 }
-

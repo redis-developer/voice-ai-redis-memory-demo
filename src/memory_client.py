@@ -9,6 +9,7 @@ import httpx
 import redis
 from agent_memory_client import create_memory_client
 from agent_memory_client.models import MemoryMessage, ClientMemoryRecord, MemoryTypeEnum
+from src.observability import now_ms, log_timing
 
 load_dotenv()
 
@@ -26,6 +27,19 @@ class MemoryClient:
         self.base_url = base_url or os.getenv("MEMORY_SERVER_URL", "http://localhost:8001")
         self.namespace = namespace
         self._client = None
+
+    def _build_long_term_filters(self, user_id: Optional[str] = None) -> Dict[str, Dict[str, str]]:
+        """Build explicit long-term memory filters for Redis AMS.
+
+        AMS docs recommend filtering personal data by ``user_id`` and
+        using ``namespace`` to isolate app/domain-specific memories.
+        """
+        filters: Dict[str, Dict[str, str]] = {
+            "namespace": {"eq": self.namespace},
+        }
+        if user_id:
+            filters["user_id"] = {"eq": user_id}
+        return filters
     
     async def _get_client(self):
         """Get or create the memory client."""
@@ -44,11 +58,14 @@ class MemoryClient:
     
     async def health_check(self) -> bool:
         """Check if the memory server is healthy."""
+        start_ms = now_ms()
         try:
             async with httpx.AsyncClient() as http:
                 response = await http.get(f"{self.base_url}/v1/health")
+                log_timing("memory.health_check", start_ms, logger_instance=logger, status_code=response.status_code)
                 return response.status_code == 200
-        except Exception:
+        except Exception as exc:
+            log_timing("memory.health_check", start_ms, logger_instance=logger, error=type(exc).__name__)
             return False
     
     async def add_journal_entry(
@@ -74,6 +91,7 @@ class MemoryClient:
         Returns:
             Entry information dict
         """
+        start_ms = now_ms()
         client = await self._get_client()
         now = datetime.now(timezone.utc)
         
@@ -104,6 +122,7 @@ class MemoryClient:
             messages=[message],
             user_id=user_id
         )
+        log_timing("memory.add_journal_entry", start_ms, logger_instance=logger, session_id=session_id, created=created)
         
         return {
             "session_id": session_id,
@@ -132,6 +151,7 @@ class MemoryClient:
         Returns:
             Dict with status and memory info
         """
+        start_ms = now_ms()
         client = await self._get_client()
         now = datetime.now(timezone.utc)
         date_str = now.strftime("%B %d, %Y")
@@ -152,6 +172,7 @@ class MemoryClient:
                 memories=[memory],
                 deduplicate=False  # Allow multiple mood entries per day
             )
+            log_timing("memory.save_mood", start_ms, logger_instance=logger, user_id=user_id, mood=mood)
 
             return {
                 "status": "success",
@@ -162,6 +183,7 @@ class MemoryClient:
             }
         except Exception as e:
             logger.error(f"Error saving mood: {e}")
+            log_timing("memory.save_mood", start_ms, logger_instance=logger, user_id=user_id, mood=mood, error=True)
             return {
                 "status": "error",
                 "error": str(e),
@@ -194,6 +216,7 @@ class MemoryClient:
         Returns:
             Dict with status and memory info
         """
+        start_ms = now_ms()
         client = await self._get_client()
         now = datetime.now(timezone.utc)
 
@@ -214,6 +237,14 @@ class MemoryClient:
                 memories=[memory],
                 deduplicate=True
             )
+            log_timing(
+                "memory.create_journal_memory",
+                start_ms,
+                logger_instance=logger,
+                user_id=user_id,
+                transcript_chars=len(transcript),
+                session_id=session_id,
+            )
 
             return {
                 "status": response.status,
@@ -225,6 +256,15 @@ class MemoryClient:
             }
         except Exception as e:
             logger.error(f"Error creating long-term memory: {e}")
+            log_timing(
+                "memory.create_journal_memory",
+                start_ms,
+                logger_instance=logger,
+                user_id=user_id,
+                transcript_chars=len(transcript),
+                session_id=session_id,
+                error=True,
+            )
             return {
                 "status": "error",
                 "error": str(e),
@@ -301,26 +341,21 @@ class MemoryClient:
         Returns:
             List of memory records with text, distance, and metadata
         """
-        import time
-        t0 = time.time()
+        t0 = now_ms()
         client = await self._get_client()
-        logger.debug(f"Memory client get: {time.time() - t0:.2f}s")
+        log_timing("memory.search.client_get", t0, logger_instance=logger)
 
         try:
-            # Import filter classes
-            from agent_memory_client.filters import UserId
+            filters = self._build_long_term_filters(user_id=user_id)
 
-            # Build user_id filter if provided
-            user_filter = UserId(eq=user_id) if user_id else None
-
-            t1 = time.time()
+            t1 = now_ms()
             results = await client.search_long_term_memory(
                 text=query,
-                user_id=user_filter,
+                filters=filters,
                 limit=limit,
                 distance_threshold=distance_threshold
             )
-            logger.debug(f"Memory search API call: {time.time() - t1:.2f}s")
+            log_timing("memory.search.api_call", t1, logger_instance=logger, query_chars=len(query), limit=limit)
 
             # Convert to list of dicts
             memories = []
@@ -337,10 +372,12 @@ class MemoryClient:
                     "namespace": memory.namespace
                 })
 
+            log_timing("memory.search.total", t0, logger_instance=logger, results=len(memories), user_id=user_id)
             return memories
 
         except Exception as e:
             logger.error(f"Error searching long-term memory: {e}")
+            log_timing("memory.search.total", t0, logger_instance=logger, results=0, user_id=user_id, error=True)
             return []
 
     async def search_memory_tool(
@@ -405,6 +442,7 @@ class MemoryClient:
         Returns:
             True if saved successfully, False otherwise
         """
+        start_ms = now_ms()
         client = await self._get_client()
         now = datetime.now(timezone.utc)
 
@@ -428,11 +466,12 @@ class MemoryClient:
                 user_id=user_id
             )
 
-            logger.debug(f"Working memory saved conversation turn - Session: {session_id}")
+            log_timing("memory.save_conversation_turn", start_ms, logger_instance=logger, session_id=session_id)
             return True
 
         except Exception as e:
             logger.warning(f"Working memory error saving turn: {e}")
+            log_timing("memory.save_conversation_turn", start_ms, logger_instance=logger, session_id=session_id, error=True)
             return False
 
     async def get_conversation_context(
@@ -455,20 +494,20 @@ class MemoryClient:
         Returns:
             Formatted conversation history string, or empty string if no history
         """
-        import time
-        t0 = time.time()
+        t0 = now_ms()
         client = await self._get_client()
-        logger.debug(f"Working memory client get: {time.time() - t0:.2f}s")
+        log_timing("memory.working_context.client_get", t0, logger_instance=logger, session_id=session_id)
 
         try:
-            t1 = time.time()
+            t1 = now_ms()
             _, working_memory = await client.get_or_create_working_memory(
                 session_id=session_id,
                 user_id=user_id
             )
-            logger.debug(f"Working memory API call: {time.time() - t1:.2f}s")
+            log_timing("memory.working_context.api_call", t1, logger_instance=logger, session_id=session_id, max_turns=max_turns)
 
             if not working_memory.messages:
+                log_timing("memory.working_context.total", t0, logger_instance=logger, session_id=session_id, message_count=0, chars=0)
                 return ""
 
             # Get recent messages (limit to max_turns * 2 for user+assistant pairs)
@@ -480,10 +519,20 @@ class MemoryClient:
                 role_label = "User" if msg.role == "user" else "Assistant"
                 lines.append(f"{role_label}: {msg.content}")
 
-            return "\n".join(lines)
+            context = "\n".join(lines)
+            log_timing(
+                "memory.working_context.total",
+                t0,
+                logger_instance=logger,
+                session_id=session_id,
+                message_count=len(recent_messages),
+                chars=len(context),
+            )
+            return context
 
         except Exception as e:
             logger.warning(f"Working memory error getting context: {e}")
+            log_timing("memory.working_context.total", t0, logger_instance=logger, session_id=session_id, message_count=0, chars=0, error=True)
             return ""
 
     async def get_combined_context(
@@ -546,4 +595,3 @@ class MemoryClient:
         long_term_context = "\n".join(long_term_lines) if long_term_lines else ""
 
         return conversation_context, long_term_context
-

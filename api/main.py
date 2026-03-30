@@ -3,17 +3,23 @@ import os
 import sys
 import logging
 import base64
+import json
+import hmac
+import hashlib
 import tempfile
 import uuid
 import asyncio
+import time
 from datetime import datetime
 from typing import Optional, List, Dict
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2 import id_token
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,11 +36,13 @@ from src.analytics import JournalAnalytics
 from src.memory_client import MemoryClient
 from src.voice_agent import VoiceJournalAgent
 from src.calendar_client import CalendarClient
+from src.observability import now_ms, log_timing, set_request_context, reset_request_context, update_request_context
 
 # Global clients
 memory_client: Optional[MemoryClient] = None
 calendar_client: Optional[CalendarClient] = None
 agents: Dict[str, VoiceJournalAgent] = {}  # (user_id, session_id) -> agent
+google_auth_request = GoogleAuthRequest()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -63,9 +71,12 @@ cors_origins = [
     if origin.strip()
 ]
 
+allow_all_origins = "*" in cors_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins or ["http://localhost:3000"],
+    allow_origins=[] if allow_all_origins else (cors_origins or ["http://localhost:3000"]),
+    allow_origin_regex=r"https?://.*" if allow_all_origins else None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -101,6 +112,137 @@ class EntryUpdate(BaseModel):
     tags: Optional[List[str]] = None
 
 
+class GoogleAuthRequestBody(BaseModel):
+    credential: str
+
+
+class GoogleAuthResponse(BaseModel):
+    provider: str = "google"
+    user_id: str
+    google_sub: str
+    session_token: str
+    email: Optional[str] = None
+    name: Optional[str] = None
+    picture: Optional[str] = None
+
+
+def build_google_user_id(google_sub: str) -> str:
+    return f"google_{google_sub}"
+
+
+def get_google_client_id() -> str:
+    return os.getenv("GOOGLE_CLIENT_ID", "").strip()
+
+
+def _get_session_signing_secret() -> str:
+    return (
+        os.getenv("APP_AUTH_SECRET", "").strip()
+        or os.getenv("OPENAI_API_KEY", "").strip()
+        or os.getenv("GOOGLE_CLIENT_ID", "").strip()
+    )
+
+
+def _decode_token_part(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def create_session_token(user_id: str, google_sub: str, expires_in_seconds: int = 60 * 60 * 24 * 7) -> str:
+    secret = _get_session_signing_secret()
+    if not secret:
+        raise HTTPException(status_code=500, detail="Session signing secret is not configured")
+
+    payload = {
+        "user_id": user_id,
+        "google_sub": google_sub,
+        "exp": int(time.time()) + expires_in_seconds,
+    }
+    payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    payload_b64 = base64.urlsafe_b64encode(payload_json).decode("utf-8").rstrip("=")
+    signature = hmac.new(secret.encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256).digest()
+    signature_b64 = base64.urlsafe_b64encode(signature).decode("utf-8").rstrip("=")
+    return f"{payload_b64}.{signature_b64}"
+
+
+def verify_session_token(session_token: str) -> Dict[str, str]:
+    secret = _get_session_signing_secret()
+    if not secret:
+        raise HTTPException(status_code=500, detail="Session signing secret is not configured")
+
+    try:
+        payload_b64, signature_b64 = session_token.split(".", 1)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="Invalid session token") from exc
+
+    expected_signature = hmac.new(
+        secret.encode("utf-8"),
+        payload_b64.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    actual_signature = _decode_token_part(signature_b64)
+    if not hmac.compare_digest(actual_signature, expected_signature):
+        raise HTTPException(status_code=401, detail="Invalid session token")
+
+    try:
+        payload = json.loads(_decode_token_part(payload_b64))
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=401, detail="Invalid session token") from exc
+
+    user_id = payload.get("user_id")
+    google_sub = payload.get("google_sub")
+    exp = payload.get("exp")
+    if not user_id or not google_sub or not exp:
+        raise HTTPException(status_code=401, detail="Invalid session token")
+    if int(exp) < int(time.time()):
+        raise HTTPException(status_code=401, detail="Session token expired")
+
+    return {
+        "user_id": str(user_id),
+        "google_sub": str(google_sub),
+    }
+
+
+def get_authenticated_user(authorization: Optional[str] = Header(default=None)) -> Dict[str, str]:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Google session")
+    return verify_session_token(authorization.removeprefix("Bearer ").strip())
+
+
+@app.post("/api/auth/google", response_model=GoogleAuthResponse)
+async def google_auth(request: GoogleAuthRequestBody):
+    """Verify a Google ID token and return a stable app user id."""
+    client_id = get_google_client_id()
+    if not client_id:
+        raise HTTPException(status_code=500, detail="GOOGLE_CLIENT_ID is not configured")
+
+    try:
+        claims = id_token.verify_oauth2_token(
+            request.credential,
+            google_auth_request,
+            audience=client_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="Invalid Google credential") from exc
+    except Exception as exc:
+        logger.warning(f"Google auth verification failed: {exc}")
+        raise HTTPException(status_code=401, detail="Unable to verify Google credential") from exc
+
+    google_sub = claims.get("sub")
+    if not google_sub:
+        raise HTTPException(status_code=401, detail="Google credential missing subject")
+
+    user_id = build_google_user_id(google_sub)
+    session_token = create_session_token(user_id=user_id, google_sub=google_sub)
+    return GoogleAuthResponse(
+        user_id=user_id,
+        google_sub=google_sub,
+        session_token=session_token,
+        email=claims.get("email"),
+        name=claims.get("name"),
+        picture=claims.get("picture"),
+    )
+
+
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint."""
@@ -113,18 +255,29 @@ async def health_check():
 
 
 @app.post("/api/transcribe")
-async def transcribe_audio(request: TranscribeRequest):
+async def transcribe_audio(
+    payload: TranscribeRequest,
+    http_request: Request,
+    auth_user: Dict[str, str] = Depends(get_authenticated_user),
+):
     """Transcribe audio using Sarvam AI and store in memory."""
+    user_id = auth_user["user_id"]
+    request_id = get_request_id(http_request)
+    token = set_request_context(
+        request_id=request_id,
+        route="/api/transcribe",
+        user_id=user_id,
+    )
+    total_start_ms = now_ms()
+    timings_ms: Dict[str, float] = {}
     try:
-        import time
-        stt_start = time.time()
-
         # Decode base64 audio
-        audio_data = base64.b64decode(request.audio_base64)
+        audio_data = base64.b64decode(payload.audio_base64)
 
         # Browser MediaRecorder sends webm/opus, not WAV
         # Detect format by checking magic bytes
         is_wav = audio_data[:4] == b'RIFF' and audio_data[8:12] == b'WAVE'
+        stt_start_ms = now_ms()
 
         if is_wav:
             # WAV format: use WebSocket streaming for lower latency
@@ -134,9 +287,9 @@ async def transcribe_audio(request: TranscribeRequest):
 
             try:
                 transcript, language_code = await audio_handler.transcribe_stream(
-                    temp_path, language_code=request.language_code
+                    temp_path, language_code=payload.language_code
                 )
-                logger.debug(f"STT (streaming): {time.time() - stt_start:.2f}s")
+                timings_ms["stt_stream"] = log_timing("api.transcribe.stt_stream", stt_start_ms, logger_instance=logger)
             finally:
                 os.unlink(temp_path)
         else:
@@ -160,41 +313,50 @@ async def transcribe_audio(request: TranscribeRequest):
             try:
                 # REST API handles format detection automatically
                 transcript, language_code, _ = audio_handler.transcribe(
-                    temp_path, language_code=request.language_code
+                    temp_path, language_code=payload.language_code
                 )
-                logger.debug(f"STT (REST): {time.time() - stt_start:.2f}s")
+                timings_ms["stt_rest"] = log_timing("api.transcribe.stt_rest", stt_start_ms, logger_instance=logger)
             finally:
                 os.unlink(temp_path)
 
         # Generate session ID if not provided
-        session_id = request.session_id or str(uuid.uuid4())
+        session_id = payload.session_id or str(uuid.uuid4())
+        update_request_context(session_id=session_id)
 
         # Store in Redis Agent Memory Server (long-term memory for retrieval)
         memory_entry = None
-        if request.store_in_memory and memory_client:
+        if payload.store_in_memory and memory_client:
             try:
+                memory_start_ms = now_ms()
                 memory_entry = await memory_client.create_journal_memory(
-                    user_id=request.user_id,
+                    user_id=user_id,
                     transcript=transcript,
                     language_code=language_code,
                     topics=["journal", "voice_entry"],
                     session_id=session_id
                 )
+                timings_ms["memory_write"] = log_timing("api.transcribe.memory_write", memory_start_ms, logger_instance=logger)
                 logger.info(f"Stored voice entry in long-term memory: {memory_entry.get('memory_id', 'unknown')}")
             except Exception as mem_err:
                 logger.warning(f"Failed to store in memory: {mem_err}")
+
+        timings_ms["total"] = log_timing("api.transcribe.total", total_start_ms, logger_instance=logger)
 
         return {
             "transcript": transcript,
             "language_code": language_code,
             "session_id": session_id,
             "stored_in_memory": memory_entry is not None,
-            "memory_entry": memory_entry
+            "memory_entry": memory_entry,
+            "request_id": request_id,
+            "timings_ms": timings_ms,
         }
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        reset_request_context(token)
 
 
 @app.post("/api/tts")
@@ -208,24 +370,27 @@ def text_to_speech(text: str, language_code: str = "en-IN", speaker: str = "shub
 
 
 @app.get("/api/entries")
-def list_entries(user_id: str = "default_user", limit: int = 50):
+def list_entries(limit: int = 50, auth_user: Dict[str, str] = Depends(get_authenticated_user)):
     """List journal entries."""
-    entries = journal_manager.list_entries(user_id, limit=limit)
+    entries = journal_manager.list_entries(auth_user["user_id"], limit=limit)
     return {"entries": entries, "total": len(entries)}
 
 
 @app.get("/api/entries/{entry_id}")
-def get_entry(entry_id: str):
+def get_entry(entry_id: str, auth_user: Dict[str, str] = Depends(get_authenticated_user)):
     """Get a specific entry."""
     entry = journal_manager.get_entry(entry_id)
     if not entry:
         raise HTTPException(status_code=404, detail="Entry not found")
+    if entry.get("user_id") != auth_user["user_id"]:
+        raise HTTPException(status_code=403, detail="Entry does not belong to the signed-in user")
     return entry
 
 
 @app.post("/api/entries")
-async def create_entry(entry: EntryCreate):
+async def create_entry(entry: EntryCreate, auth_user: Dict[str, str] = Depends(get_authenticated_user)):
     """Create a new journal entry and store in memory."""
+    user_id = auth_user["user_id"]
     # Generate session ID if not provided
     session_id = entry.session_id or str(uuid.uuid4())
 
@@ -234,7 +399,7 @@ async def create_entry(entry: EntryCreate):
         try:
             await memory_client.add_journal_entry(
                 session_id=session_id,
-                user_id=entry.user_id,
+                user_id=user_id,
                 transcript=entry.transcript,
                 language_code=entry.language_code,
                 metadata={
@@ -250,7 +415,7 @@ async def create_entry(entry: EntryCreate):
 
     # Also store in journal manager for local persistence
     new_entry = journal_manager.create_entry(
-        user_id=entry.user_id,
+        user_id=user_id,
         transcript=entry.transcript,
         language_code=entry.language_code,
         mood=entry.mood,
@@ -261,34 +426,40 @@ async def create_entry(entry: EntryCreate):
 
 
 @app.get("/api/memory/session/{session_id}")
-async def get_session_history(session_id: str, user_id: str = "default_user"):
+async def get_session_history(session_id: str, auth_user: Dict[str, str] = Depends(get_authenticated_user)):
     """Get conversation history from memory for a session."""
     if not memory_client:
         raise HTTPException(status_code=503, detail="Memory server not available")
 
     try:
-        history = await memory_client.get_session_history(session_id, user_id)
+        history = await memory_client.get_session_history(session_id, auth_user["user_id"])
         return {"session_id": session_id, "messages": history, "count": len(history)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/api/memory/session/{session_id}")
-async def end_session(session_id: str):
+async def end_session(session_id: str, auth_user: Dict[str, str] = Depends(get_authenticated_user)):
     """End a session and cleanup working memory."""
     if not memory_client:
         raise HTTPException(status_code=503, detail="Memory server not available")
 
     try:
-        await memory_client.end_session(session_id)
-        return {"status": "session_ended", "session_id": session_id}
+        await memory_client.get_session_history(session_id, auth_user["user_id"])
+        return {"status": "session_verified", "session_id": session_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.patch("/api/entries/{entry_id}")
-def update_entry(entry_id: str, entry: EntryUpdate):
+def update_entry(entry_id: str, entry: EntryUpdate, auth_user: Dict[str, str] = Depends(get_authenticated_user)):
     """Update a journal entry."""
+    existing_entry = journal_manager.get_entry(entry_id)
+    if not existing_entry:
+        raise HTTPException(status_code=404, detail="Entry not found")
+    if existing_entry.get("user_id") != auth_user["user_id"]:
+        raise HTTPException(status_code=403, detail="Entry does not belong to the signed-in user")
+
     updated = journal_manager.update_entry(
         entry_id,
         transcript=entry.transcript,
@@ -301,8 +472,14 @@ def update_entry(entry_id: str, entry: EntryUpdate):
 
 
 @app.delete("/api/entries/{entry_id}")
-def delete_entry(entry_id: str):
+def delete_entry(entry_id: str, auth_user: Dict[str, str] = Depends(get_authenticated_user)):
     """Delete a journal entry."""
+    existing_entry = journal_manager.get_entry(entry_id)
+    if not existing_entry:
+        raise HTTPException(status_code=404, detail="Entry not found")
+    if existing_entry.get("user_id") != auth_user["user_id"]:
+        raise HTTPException(status_code=403, detail="Entry does not belong to the signed-in user")
+
     success = journal_manager.delete_entry(entry_id)
     if not success:
         raise HTTPException(status_code=404, detail="Entry not found")
@@ -310,8 +487,9 @@ def delete_entry(entry_id: str):
 
 
 @app.get("/api/analytics")
-def get_analytics(user_id: str = "default_user"):
+def get_analytics(auth_user: Dict[str, str] = Depends(get_authenticated_user)):
     """Get analytics for user."""
+    user_id = auth_user["user_id"]
     return {
         "summary": analytics.get_activity_summary(user_id, days=30),
         "streak": analytics.get_streak(user_id),
@@ -327,17 +505,16 @@ class MoodRequest(BaseModel):
     """Request for saving mood."""
     mood: str  # e.g., "Happy", "Sad"
     emoji: str  # e.g., "😊", "😢"
-    user_id: str = "default_user"
 
 
 @app.post("/api/mood")
-async def save_mood(request: MoodRequest):
+async def save_mood(request: MoodRequest, auth_user: Dict[str, str] = Depends(get_authenticated_user)):
     """Save user's current mood to memory."""
     if not memory_client:
         raise HTTPException(status_code=503, detail="Memory server not available")
 
     result = await memory_client.save_mood(
-        user_id=request.user_id,
+        user_id=auth_user["user_id"],
         mood=request.mood,
         emoji=request.emoji
     )
@@ -354,7 +531,6 @@ class AgentChatRequest(BaseModel):
     """Request for agent chat endpoint."""
     text: Optional[str] = None
     audio_base64: Optional[str] = None
-    user_id: str = "default_user"
     session_id: Optional[str] = None  # For working memory / conversation continuity
     language_code: Optional[str] = None
 
@@ -368,6 +544,13 @@ class AgentChatResponse(BaseModel):
     entry_count: int
     session_id: str  # Return session_id for frontend to persist
     transcribed_text: Optional[str] = None  # For debugging STT
+    request_id: Optional[str] = None
+    timings_ms: Optional[Dict[str, float]] = None
+
+
+def get_request_id(http_request: Request) -> str:
+    """Return the client request id or generate one."""
+    return http_request.headers.get("X-Request-ID") or f"req_{uuid.uuid4().hex[:12]}"
 
 
 def get_or_create_agent(user_id: str, session_id: str) -> VoiceJournalAgent:
@@ -385,25 +568,37 @@ def get_or_create_agent(user_id: str, session_id: str) -> VoiceJournalAgent:
 
 
 @app.post("/api/agent/chat", response_model=AgentChatResponse)
-async def agent_chat(request: AgentChatRequest):
+async def agent_chat(
+    payload: AgentChatRequest,
+    http_request: Request,
+    auth_user: Dict[str, str] = Depends(get_authenticated_user),
+):
     """
     Main agent endpoint for voice journal interaction.
 
     Accepts either text or audio input.
     Returns response text and optional TTS audio.
     """
-    import time
-    timings = {}
-    total_start = time.time()
+    timings_ms: Dict[str, float] = {}
+    request_id = get_request_id(http_request)
+    total_start_ms = now_ms()
 
-    text = request.text
+    user_id = auth_user["user_id"]
+    text = payload.text
     transcribed_text = None  # Track what was transcribed from audio
+    session_id = payload.session_id or f"session_{uuid.uuid4().hex[:12]}"
+    token = set_request_context(
+        request_id=request_id,
+        route="/api/agent/chat",
+        user_id=user_id,
+        session_id=session_id,
+    )
 
     # If audio provided, transcribe first
-    if request.audio_base64 and not text:
+    if payload.audio_base64 and not text:
         try:
-            stt_start = time.time()
-            audio_data = base64.b64decode(request.audio_base64)
+            stt_start_ms = now_ms()
+            audio_data = base64.b64decode(payload.audio_base64)
 
             # Browser MediaRecorder sends webm/opus, not WAV
             # Detect format by checking magic bytes
@@ -417,12 +612,11 @@ async def agent_chat(request: AgentChatRequest):
 
                 try:
                     transcript, lang_code = await audio_handler.transcribe_stream(
-                        temp_path, language_code=request.language_code
+                        temp_path, language_code=payload.language_code
                     )
                     text = transcript
                     transcribed_text = transcript
-                    timings['stt'] = time.time() - stt_start
-                    logger.debug(f"STT (streaming): {timings['stt']:.2f}s - '{transcript}'")
+                    timings_ms['stt_stream'] = log_timing("api.agent_chat.stt_stream", stt_start_ms, logger_instance=logger, transcript_chars=len(transcript))
                 finally:
                     os.unlink(temp_path)
             else:
@@ -446,13 +640,11 @@ async def agent_chat(request: AgentChatRequest):
                 try:
                     # REST API handles format detection automatically
                     transcript, lang_code, _ = audio_handler.transcribe(
-                        temp_path, language_code=request.language_code
+                        temp_path, language_code=payload.language_code
                     )
                     text = transcript
                     transcribed_text = transcript
-                    detected_language = lang_code  # Use detected language for TTS
-                    timings['stt'] = time.time() - stt_start
-                    logger.debug(f"STT (REST): {timings['stt']:.2f}s - '{transcript}' [lang={lang_code}]")
+                    timings_ms['stt_rest'] = log_timing("api.agent_chat.stt_rest", stt_start_ms, logger_instance=logger, transcript_chars=len(transcript), language_code=lang_code)
                 finally:
                     os.unlink(temp_path)
 
@@ -468,37 +660,32 @@ async def agent_chat(request: AgentChatRequest):
     if not text:
         raise HTTPException(status_code=400, detail="No speech detected. Please try speaking again.")
 
-    # Generate session_id if not provided (for working memory / conversation continuity)
-    session_id = request.session_id or f"session_{uuid.uuid4().hex[:12]}"
-
     # Get agent and process
-    agent = get_or_create_agent(request.user_id, session_id)
+    agent = get_or_create_agent(user_id, session_id)
 
     try:
-        agent_start = time.time()
+        agent_start_ms = now_ms()
         response_text, _ = await agent.process_input(text)
-        timings['agent'] = time.time() - agent_start
-        logger.debug(f"Agent processing: {timings['agent']:.2f}s")
+        timings_ms['agent'] = log_timing("api.agent_chat.agent", agent_start_ms, logger_instance=logger, mode=agent.get_mode())
 
         # Get TTS audio for response (using streaming for faster first-byte)
         audio_base64 = None
         try:
-            tts_start = time.time()
+            tts_start_ms = now_ms()
             # Use streaming TTS for lower latency
             audio_bytes = await audio_handler.text_to_speech_stream_full(
                 response_text, "en-IN", "shubh"
             )
             audio_base64 = base64.b64encode(audio_bytes).decode()
-            timings['tts'] = time.time() - tts_start
-            logger.debug(f"TTS (streaming): {timings['tts']:.2f}s")
+            timings_ms['tts_stream'] = log_timing("api.agent_chat.tts_stream", tts_start_ms, logger_instance=logger, response_chars=len(response_text))
         except Exception as tts_err:
             logger.warning(f"TTS streaming failed, trying non-streaming: {tts_err}")
             # Fallback to non-streaming
             try:
+                fallback_tts_start_ms = now_ms()
                 audio_bytes = audio_handler.text_to_speech(response_text, "en-IN", "shubh")
                 audio_base64 = base64.b64encode(audio_bytes).decode()
-                timings['tts'] = time.time() - tts_start
-                logger.debug(f"TTS (fallback): {timings['tts']:.2f}s")
+                timings_ms['tts_fallback'] = log_timing("api.agent_chat.tts_fallback", fallback_tts_start_ms, logger_instance=logger, response_chars=len(response_text))
             except Exception as e2:
                 logger.error(f"TTS fallback also failed: {e2}")
 
@@ -508,8 +695,13 @@ async def agent_chat(request: AgentChatRequest):
         # Infer intent from mode (semantic router already detected it in process_input)
         intent_str = agent.state.mode.value  # "log" or "chat"
 
-        timings['total'] = time.time() - total_start
-        logger.info(f"Request completed: {timings['total']:.2f}s (STT: {timings.get('stt', 0):.2f}s, Agent: {timings.get('agent', 0):.2f}s, TTS: {timings.get('tts', 0):.2f}s)")
+        timings_ms['total'] = log_timing(
+            "api.agent_chat.total",
+            total_start_ms,
+            logger_instance=logger,
+            has_audio=bool(payload.audio_base64),
+            mode=agent.get_mode(),
+        )
 
         return AgentChatResponse(
             response=response_text,
@@ -518,32 +710,52 @@ async def agent_chat(request: AgentChatRequest):
             audio_base64=audio_base64,
             entry_count=entry_count,
             session_id=session_id,
-            transcribed_text=transcribed_text
+            transcribed_text=transcribed_text,
+            request_id=request_id,
+            timings_ms=timings_ms,
         )
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        reset_request_context(token)
 
 
 @app.post("/api/agent/chat/stream")
-async def agent_chat_stream(request: AgentChatRequest):
+async def agent_chat_stream(
+    payload: AgentChatRequest,
+    http_request: Request,
+    auth_user: Dict[str, str] = Depends(get_authenticated_user),
+):
     """
     Streaming version of agent chat - streams TTS audio chunks as they arrive.
 
     First sends JSON metadata (response text, intent, etc.), then streams audio chunks.
     Uses multipart response: first part is JSON, subsequent parts are audio chunks.
     """
-    import time
     import json
 
-    text = request.text
+    request_id = get_request_id(http_request)
+    total_start_ms = now_ms()
+    timings_ms: Dict[str, float] = {}
+
+    user_id = auth_user["user_id"]
+    text = payload.text
     transcribed_text = None
+    session_id = payload.session_id or f"session_{uuid.uuid4().hex[:12]}"
+    token = set_request_context(
+        request_id=request_id,
+        route="/api/agent/chat/stream",
+        user_id=user_id,
+        session_id=session_id,
+    )
 
     # If audio provided, transcribe first (same as non-streaming endpoint)
-    if request.audio_base64 and not text:
+    if payload.audio_base64 and not text:
         try:
-            audio_data = base64.b64decode(request.audio_base64)
+            stt_start_ms = now_ms()
+            audio_data = base64.b64decode(payload.audio_base64)
             is_wav = audio_data[:4] == b'RIFF' and audio_data[8:12] == b'WAVE'
 
             if is_wav:
@@ -552,6 +764,7 @@ async def agent_chat_stream(request: AgentChatRequest):
                     temp_path = f.name
                 try:
                     text, _ = await audio_handler.transcribe_stream(temp_path, language_code="en-IN")
+                    timings_ms["stt_stream"] = log_timing("api.agent_chat_stream.stt_stream", stt_start_ms, logger_instance=logger, transcript_chars=len(text or ""))
                 finally:
                     os.unlink(temp_path)
             else:
@@ -559,7 +772,8 @@ async def agent_chat_stream(request: AgentChatRequest):
                     f.write(audio_data)
                     temp_path = f.name
                 try:
-                    text, _ = audio_handler.transcribe(temp_path)
+                    text, _, _ = audio_handler.transcribe(temp_path)
+                    timings_ms["stt_rest"] = log_timing("api.agent_chat_stream.stt_rest", stt_start_ms, logger_instance=logger, transcript_chars=len(text or ""))
                 finally:
                     os.unlink(temp_path)
             transcribed_text = text
@@ -569,61 +783,98 @@ async def agent_chat_stream(request: AgentChatRequest):
     if not text:
         raise HTTPException(status_code=400, detail="Either text or audio_base64 is required")
 
-    session_id = request.session_id or f"session_{uuid.uuid4().hex[:12]}"
-    agent = get_or_create_agent(request.user_id, session_id)
+    agent = get_or_create_agent(user_id, session_id)
 
     # Get agent response (text only)
+    agent_start_ms = now_ms()
     response_text, _ = await agent.process_input(text)
+    timings_ms["agent"] = log_timing("api.agent_chat_stream.agent", agent_start_ms, logger_instance=logger, mode=agent.get_mode())
     entry_count = 0  # Entry count not tracked (store removed)
     intent_str = agent.state.mode.value
 
     async def generate_stream():
         """Generator that yields JSON metadata then audio chunks."""
-        # First, yield JSON metadata as a line
-        metadata = {
-            "type": "metadata",
-            "response": response_text,
-            "intent": intent_str,
-            "mode": agent.get_mode(),
-            "entry_count": entry_count,
-            "session_id": session_id,
-            "transcribed_text": transcribed_text
-        }
-        yield json.dumps(metadata).encode() + b"\n"
-
-        # Then stream TTS audio chunks
         try:
+            # First, yield JSON metadata as a line
+            metadata = {
+                "type": "metadata",
+                "response": response_text,
+                "intent": intent_str,
+                "mode": agent.get_mode(),
+                "entry_count": entry_count,
+                "session_id": session_id,
+                "transcribed_text": transcribed_text,
+                "request_id": request_id,
+                "timings_ms": {
+                    **timings_ms,
+                    "pre_tts_total": log_timing(
+                        "api.agent_chat_stream.pre_tts_total",
+                        total_start_ms,
+                        logger_instance=logger,
+                        has_audio=bool(payload.audio_base64),
+                        mode=agent.get_mode(),
+                    ),
+                },
+            }
+            yield json.dumps(metadata).encode() + b"\n"
+
+            # Then stream TTS audio chunks
+            tts_start_ms = now_ms()
             async for chunk in audio_handler.text_to_speech_stream(response_text, "en-IN", "shubh"):
                 # Yield audio chunk with a simple prefix to identify it
                 yield b"AUDIO:" + base64.b64encode(chunk) + b"\n"
+            timings_ms["tts_stream"] = log_timing("api.agent_chat_stream.tts_stream", tts_start_ms, logger_instance=logger, response_chars=len(response_text))
         except Exception as e:
             logger.error(f"TTS stream error: {e}")
             # Yield error message
             yield json.dumps({"type": "error", "message": str(e)}).encode() + b"\n"
-
-        # Signal end of stream
-        yield json.dumps({"type": "done"}).encode() + b"\n"
+        finally:
+            # Signal end of stream
+            yield json.dumps({
+                "type": "done",
+                "request_id": request_id,
+                "timings_ms": {
+                    **timings_ms,
+                    "total": log_timing(
+                        "api.agent_chat_stream.total",
+                        total_start_ms,
+                        logger_instance=logger,
+                        has_audio=bool(payload.audio_base64),
+                        mode=agent.get_mode(),
+                    ),
+                },
+            }).encode() + b"\n"
+            reset_request_context(token)
 
     return StreamingResponse(
         generate_stream(),
         media_type="text/plain",
-        headers={"X-Content-Type-Options": "nosniff"}
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "X-Request-ID": request_id,
+        }
     )
 
 
 @app.get("/api/agent/mode")
-def get_agent_mode(user_id: str = "default_user", session_id: str = "default_session"):
+def get_agent_mode(session_id: str = "default_session", auth_user: Dict[str, str] = Depends(get_authenticated_user)):
     """Get current agent mode."""
+    user_id = auth_user["user_id"]
     agent = get_or_create_agent(user_id, session_id)
     return {"mode": agent.get_mode(), "user_id": user_id}
 
 
 @app.post("/api/agent/mode")
-def set_agent_mode(user_id: str = "default_user", session_id: str = "default_session", mode: str = "log"):
+def set_agent_mode(
+    session_id: str = "default_session",
+    mode: str = "log",
+    auth_user: Dict[str, str] = Depends(get_authenticated_user),
+):
     """Set agent mode (log or chat)."""
     if mode not in ("log", "chat"):
         raise HTTPException(status_code=400, detail="Mode must be 'log' or 'chat'")
 
+    user_id = auth_user["user_id"]
     agent = get_or_create_agent(user_id, session_id)
     agent.set_mode(mode)
     return {"mode": agent.get_mode(), "user_id": user_id}

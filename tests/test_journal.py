@@ -48,6 +48,48 @@ class TestMemoryClient:
         assert isinstance(result, bool)
         await client.close()
 
+    def test_build_long_term_filters(self):
+        """Long-term memory searches should always scope by namespace and user."""
+        from src.memory_client import MemoryClient
+
+        client = MemoryClient(namespace="voice-journal")
+
+        assert client._build_long_term_filters("google_123") == {
+            "namespace": {"eq": "voice-journal"},
+            "user_id": {"eq": "google_123"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_search_long_term_memory_passes_explicit_filters(self):
+        """Searches should pass documented Redis AMS filters, not implicit defaults."""
+        from src.memory_client import MemoryClient
+
+        client = MemoryClient(namespace="voice-journal")
+
+        mock_results = Mock()
+        mock_results.memories = []
+
+        mock_sdk_client = Mock()
+        mock_sdk_client.search_long_term_memory = AsyncMock(return_value=mock_results)
+
+        with patch.object(client, "_get_client", AsyncMock(return_value=mock_sdk_client)):
+            await client.search_long_term_memory(
+                query="lunch noodles",
+                user_id="google_123",
+                limit=5,
+                distance_threshold=0.6,
+            )
+
+        mock_sdk_client.search_long_term_memory.assert_awaited_once_with(
+            text="lunch noodles",
+            filters={
+                "namespace": {"eq": "voice-journal"},
+                "user_id": {"eq": "google_123"},
+            },
+            limit=5,
+            distance_threshold=0.6,
+        )
+
 
 class TestJournalManager:
     """Tests for JournalManager class."""
@@ -119,4 +161,3 @@ class TestAnalytics:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

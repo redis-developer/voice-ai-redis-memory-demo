@@ -1,0 +1,7 @@
+aws_region       = "ap-south-1"
+project_name     = "voice-journal"
+environment      = "dev"
+backend_cors_origins = "*"
+ollama_url       = ""
+ollama_model     = "llama3.2"
+memory_server_generation_model = "gpt-4o-mini"

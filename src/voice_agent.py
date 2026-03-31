@@ -3,7 +3,7 @@
 Handles:
 - Mode switching (Log mode vs Chat mode)
 - Context assembly from retrieved entries
-- Natural voice-first response generation (via Ollama)
+- Natural voice-first response generation via OpenAI
 """
 import os
 import logging
@@ -17,16 +17,14 @@ from dotenv import load_dotenv
 from src.intent_detector import Intent, IntentResult
 from src.memory_client import MemoryClient
 from src.calendar_client import CalendarClient
-from src.intent_router import get_intent_router
 from src.observability import now_ms, log_timing, update_request_context
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Ollama configuration
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 
 
 class AgentMode(Enum):
@@ -39,7 +37,6 @@ class AgentState:
     """Tracks agent conversation state."""
     mode: AgentMode = AgentMode.LOG
     last_entries_shown: List[str] = field(default_factory=list)
-    conversation_history: List[Dict[str, str]] = field(default_factory=list)
 
 
 class VoiceJournalAgent:
@@ -59,11 +56,16 @@ class VoiceJournalAgent:
         # Initialize calendar client (lazy load on first use)
         self._calendar_client: Optional[CalendarClient] = None
 
-        # Semantic router for intent detection (lazy load)
-        self._intent_router = None
-
-    # Fallback keywords (used if semantic router fails)
+    # Explicit log keywords; all other queries go through memory-backed chat.
     LOG_KEYWORDS = ["log my note", "note this", "record this", "journal this", "save this", "remember this"]
+    GREETING_PREFIXES = (
+        "hi",
+        "hello",
+        "hey",
+        "good morning",
+        "good afternoon",
+        "good evening",
+    )
 
     @property
     def calendar_client(self) -> Optional[CalendarClient]:
@@ -79,30 +81,15 @@ class VoiceJournalAgent:
         """
         Process user input and generate response.
 
-        Uses semantic router for intent detection:
-        - "log" intent -> save as journal entry
-        - "calendar" intent -> fetch calendar + respond
-        - "chat" intent -> search journal + respond
+        Uses explicit log keywords for note-taking.
+        All non-log queries go through memory-backed chat.
         """
-        import asyncio
-
-        # Use semantic router for intent detection
         intent_start_ms = now_ms()
-        try:
-            if self._intent_router is None:
-                self._intent_router = get_intent_router()
-            # Run in thread to avoid blocking (embedding API call)
-            intent, confidence = await asyncio.to_thread(
-                self._intent_router.detect, text, 0.5
-            )
-        except Exception as e:
-            logger.warning(f"Intent router error: {e}, falling back to keywords")
-            # Fallback to keyword matching
-            text_lower = text.lower()
-            if any(kw in text_lower for kw in self.LOG_KEYWORDS):
-                intent, confidence = "log", 0.8
-            else:
-                intent, confidence = "chat", 0.5
+        text_lower = text.lower()
+        if any(kw in text_lower for kw in self.LOG_KEYWORDS):
+            intent, confidence = "log", 0.8
+        else:
+            intent, confidence = "chat", 1.0
 
         update_request_context(intent=intent)
         log_timing(
@@ -128,23 +115,15 @@ class VoiceJournalAgent:
             result = IntentResult(Intent.LOG_ENTRY, confidence, {"content": content}, text)
             response = await self._handle_log(result)
         else:
-            # Both "calendar" and "chat" go through _handle_ask (it detects calendar internally)
-            result = IntentResult(Intent.ASK_JOURNAL, confidence, {"query": text, "is_calendar": intent == "calendar"}, text)
+            result = IntentResult(Intent.ASK_JOURNAL, confidence, {"query": text, "is_calendar": False}, text)
             response = await self._handle_ask(result)
-
-        # Add to conversation history
-        self.state.conversation_history.append({"role": "user", "content": text})
-        self.state.conversation_history.append({"role": "assistant", "content": response})
-
-        # Keep history bounded
-        if len(self.state.conversation_history) > 20:
-            self.state.conversation_history = self.state.conversation_history[-20:]
 
         return response, None  # Audio generation handled separately
 
     async def _handle_log(self, result: IntentResult) -> str:
         """Handle logging a new entry."""
         self.state.mode = AgentMode.LOG
+        original_text = result.original_text
         content = result.entities.get("content", result.original_text)
 
         # Clean up log-specific phrases from transcript
@@ -158,23 +137,31 @@ class VoiceJournalAgent:
 
         # Store in long-term memory via memory_client
         try:
-            if self.memory_client:
-                write_start_ms = now_ms()
-                await self.memory_client.create_journal_memory(
+            if not self.memory_client:
+                raise RuntimeError("Redis Agent Memory Server client is not configured")
+
+            write_start_ms = now_ms()
+            await self.memory_client.create_journal_memory(
+                user_id=self.user_id,
+                transcript=content,
+                language_code="en-IN",
+                topics=["journal", "chat_entry"]
+            )
+            log_timing(
+                "agent.log.memory_write",
+                write_start_ms,
+                logger_instance=logger,
+                transcript_chars=len(content),
+            )
+            response = "Got it! I've saved your note. Anything else?"
+            if self.session_id:
+                await self.memory_client.save_conversation_turn(
+                    session_id=self.session_id,
                     user_id=self.user_id,
-                    transcript=content,
-                    language_code="en-IN",
-                    topics=["journal", "chat_entry"]
+                    user_message=original_text,
+                    assistant_response=response,
                 )
-                log_timing(
-                    "agent.log.memory_write",
-                    write_start_ms,
-                    logger_instance=logger,
-                    transcript_chars=len(content),
-                )
-                return "Got it! I've saved your note. Anything else?"
-            else:
-                return "Sorry, memory service is not available. Could you try again later?"
+            return response
         except Exception as e:
             logger.error(f"Error saving entry: {e}")
             return "Sorry, I had trouble saving that. Could you try again?"
@@ -187,7 +174,7 @@ class VoiceJournalAgent:
 
         # Search for relevant entries using Agent Memory Server's long-term memory
         if not self.memory_client:
-            return "Sorry, memory service is not available. Could you try again later?"
+            raise RuntimeError("Redis Agent Memory Server client is not configured")
 
         # Use intent from semantic router (passed via entities)
         is_calendar_query = result.entities.get("is_calendar", False)
@@ -198,21 +185,18 @@ class VoiceJournalAgent:
         async def fetch_conversation():
             fetch_start_ms = now_ms()
             if self.session_id:
-                try:
-                    conversation = await self.memory_client.get_conversation_context(
-                        session_id=self.session_id,
-                        user_id=self.user_id,
-                        max_turns=3
-                    )
-                    log_timing(
-                        "agent.fetch_working_memory",
-                        fetch_start_ms,
-                        logger_instance=logger,
-                        chars=len(conversation),
-                    )
-                    return conversation
-                except Exception as e:
-                    logger.warning(f"Working memory error: {e}")
+                conversation = await self.memory_client.get_conversation_context(
+                    session_id=self.session_id,
+                    user_id=self.user_id,
+                    max_turns=None,
+                )
+                log_timing(
+                    "agent.fetch_working_memory",
+                    fetch_start_ms,
+                    logger_instance=logger,
+                    chars=len(conversation),
+                )
+                return conversation
             log_timing("agent.fetch_working_memory", fetch_start_ms, logger_instance=logger, chars=0)
             return ""
 
@@ -222,25 +206,20 @@ class VoiceJournalAgent:
             if is_calendar_query:
                 log_timing("agent.search_long_term_memory", search_start_ms, logger_instance=logger, skipped=True, results=0)
                 return []
-            try:
-                memories = await self.memory_client.search_long_term_memory(
-                    query=query,
-                    user_id=self.user_id,
-                    limit=5,
-                    distance_threshold=0.8
-                )
-                log_timing(
-                    "agent.search_long_term_memory",
-                    search_start_ms,
-                    logger_instance=logger,
-                    skipped=False,
-                    results=len(memories),
-                )
-                return memories
-            except Exception as e:
-                logger.warning(f"Memory search error: {e}")
-                log_timing("agent.search_long_term_memory", search_start_ms, logger_instance=logger, skipped=False, results=0, error=True)
-                return []
+            memories = await self.memory_client.search_long_term_memory(
+                query=query,
+                user_id=self.user_id,
+                limit=5,
+                distance_threshold=0.6
+            )
+            log_timing(
+                "agent.search_long_term_memory",
+                search_start_ms,
+                logger_instance=logger,
+                skipped=False,
+                results=len(memories),
+            )
+            return memories
 
         async def fetch_calendar():
             fetch_start_ms = now_ms()
@@ -275,15 +254,25 @@ class VoiceJournalAgent:
             conversation_chars=len(conversation_context),
         )
 
-        # Build context - only use top result for speed
-        journal_context = self._get_top_memory(memories) if memories else ""
+        journal_context = self._format_memory_context(memories)
 
         response_start_ms = now_ms()
-        response = await self._generate_response(query, journal_context, calendar_context)
+        response = await self._generate_response(
+            query=query,
+            conversation_context=conversation_context,
+            journal_context=journal_context,
+            calendar_context=calendar_context,
+        )
+        response = self._sanitize_memory_claims(
+            query=query,
+            response=response,
+            has_journal_memories=bool(journal_context),
+        )
         log_timing(
             "agent.generate_response",
             response_start_ms,
             logger_instance=logger,
+            conversation_context_chars=len(conversation_context),
             journal_context_chars=len(journal_context),
             calendar_context_chars=len(calendar_context),
         )
@@ -308,71 +297,172 @@ class VoiceJournalAgent:
         except Exception as e:
             logger.warning(f"Working memory background save error: {e}")
 
-    def _get_top_memory(self, memories: List[Dict[str, Any]]) -> str:
-        """Get only the top (most relevant) memory result."""
+    def _format_memory_context(self, memories: List[Dict[str, Any]], max_memories: int = 3) -> str:
+        """Format the most relevant long-term memories for prompting."""
         if not memories:
             return ""
 
-        memory = memories[0]  # Top result only
-        text = memory.get("text", "")
-        return text[:200] if len(text) > 200 else text
+        lines = []
+        for memory in memories[:max_memories]:
+            text = memory.get("text", "").strip()
+            if not text:
+                continue
+            if len(text) > 180:
+                text = text[:180] + "..."
+
+            created_at = memory.get("created_at", "")
+            label = "Recent entry"
+            if created_at:
+                try:
+                    label = datetime.fromisoformat(created_at.replace("Z", "+00:00")).strftime("%b %d")
+                except Exception:
+                    label = "Recent entry"
+
+            lines.append(f"{label}: {text}")
+
+        return "\n".join(lines)
+
+    def _is_greeting(self, text: str) -> bool:
+        """Return True for short greeting-only messages."""
+        normalized = " ".join(text.lower().strip().split())
+        return normalized in self.GREETING_PREFIXES
+
+    def _sanitize_memory_claims(self, query: str, response: str, has_journal_memories: bool) -> str:
+        """Prevent contradictory answers about saved memories."""
+        if not has_journal_memories:
+            return response
+
+        normalized = response.lower()
+        contradictory_phrases = (
+            "first conversation",
+            "first time",
+            "don't have any entries",
+            "do not have any entries",
+            "no saved journal",
+            "memory doesn't exist",
+            "memory does not exist",
+            "doesn't exist for this user",
+            "does not exist for this user",
+        )
+        if any(phrase in normalized for phrase in contradictory_phrases):
+            if self._is_greeting(query):
+                return "Hello! I can see your saved journal entries and I'm ready to help with them. You can ask about past notes, summaries, or patterns."
+            return "I found saved journal entries for you and can use them to help answer questions. What would you like to know about them?"
+
+        return response
 
     async def _generate_response(
         self,
         query: str,
+        conversation_context: str,
         journal_context: str,
         calendar_context: str = ""
     ) -> str:
-        """Generate natural response using Ollama."""
+        """Generate natural response using OpenAI."""
         # Build context
         context_parts = []
+        if conversation_context:
+            context_parts.append(f"Current session conversation:\n{conversation_context}")
         if calendar_context:
             context_parts.append(f"Calendar: {calendar_context}")
         if journal_context:
-            context_parts.append(f"Journal: {journal_context}")
+            context_parts.append(f"Saved journal memories:\n{journal_context}")
 
-        if not context_parts:
-            return "I don't have any entries matching that. Try recording something first!"
+        context = "\n\n".join(context_parts) if context_parts else "No prior session conversation or saved journal memories are available for this turn."
 
-        context = "\n".join(context_parts)
+        prompt = f"""You are a friendly voice journal assistant speaking to the user in a warm, natural, conversational way.
 
-        prompt = f"""You are a voice journal assistant. Answer briefly in 1-2 sentences.
+Your job:
+- respond directly to the user's latest message
+- use the current session conversation for continuity
+- use saved long-term memories when they are relevant
+- sound supportive, clear, and human
+- keep responses concise unless the user asks for more detail
+
+You may be given:
+- Current session conversation: recent turns from this ongoing session
+- Saved memories: relevant long-term journal memories from past sessions
+- User message: the latest thing the user said
+
+Behavior rules:
+- Prioritize the user's latest message.
+- Use current session conversation first for short-term continuity.
+- Use saved memories only when they genuinely help answer or enrich the response.
+- Never claim a memory does not exist if saved memories are present in context.
+- If memory is uncertain or not clearly relevant, do not force it.
+- Do not mention "context", "working memory", "long-term memory", or internal system behavior.
+- Do not invent facts, memories, or events not present in the provided information.
+- If the user is greeting you, greet them naturally and offer help without making awkward claims like "this is our first conversation" unless that is explicitly supported.
+- If the user asks about something from the past, use saved memories carefully and speak as a helpful assistant, not as a database.
+- If the user logs a note, acknowledge it naturally and briefly.
+
+Tone:
+- warm
+- calm
+- encouraging
+- natural spoken language
+- not robotic
+- not overly verbose
+
+Response style:
+- usually 1 to 3 short paragraphs or 1 to 4 sentences
+- ask a gentle follow-up question when helpful
+- if the user seems emotional, respond with empathy first
 
 Context:
 {context}
 
-User question: {query}
+User message:
+{query}
 
-Answer:"""
+Now respond to the user naturally."""
 
         try:
-            ollama_start_ms = now_ms()
+            if not OPENAI_API_KEY:
+                raise RuntimeError("OPENAI_API_KEY is not configured")
+
+            openai_start_ms = now_ms()
             async with httpx.AsyncClient() as client:
                 response = await client.post(
-                    f"{OLLAMA_URL}/api/generate",
+                    "https://api.openai.com/v1/responses",
                     json={
-                        "model": OLLAMA_MODEL,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {
-                            "num_predict": 100,  # Keep responses short
-                            "temperature": 0.7
-                        }
+                        "model": OPENAI_CHAT_MODEL,
+                        "input": prompt,
+                        "temperature": 0.7,
+                        "max_output_tokens": 180,
                     },
-                    timeout=30.0
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=45.0,
                 )
+                response.raise_for_status()
                 data = response.json()
+                text = (data.get("output_text") or "").strip()
+                if not text:
+                    output = data.get("output", [])
+                    parts = []
+                    for item in output:
+                        for content in item.get("content", []):
+                            if content.get("type") == "output_text":
+                                parts.append(content.get("text", ""))
+                    text = "".join(parts).strip()
                 log_timing(
-                    "agent.ollama_round_trip",
-                    ollama_start_ms,
+                    "agent.openai_round_trip",
+                    openai_start_ms,
                     logger_instance=logger,
-                    model=OLLAMA_MODEL,
-                    response_chars=len(data.get("response", "").strip()),
+                    model=OPENAI_CHAT_MODEL,
+                    response_chars=len(text),
                 )
-                return data.get("response", "").strip()
+                if text:
+                    return text
+                raise RuntimeError("OpenAI returned an empty response")
         except Exception as e:
-            logger.error(f"Ollama error: {e}")
+            logger.exception("OpenAI response generation failed")
             # Fallback to simple response
+            if conversation_context:
+                return "I’m having trouble generating a full reply right now, but I do have our current conversation in context. Could you try that once more?"
             if calendar_context:
                 return f"Here's your schedule: {calendar_context}"
             if journal_context:

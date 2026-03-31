@@ -1,5 +1,10 @@
 # AWS Deployment Guide
 
+## Default Deployment Policy
+
+For this project, use `AWS App Runner` as the default deployment target.
+When a change needs to be deployed for shared use, do not stop at a local Docker rebuild; deploy the stack through App Runner unless someone explicitly asks for local-only verification.
+
 This project can be shared as a hosted web app for a small team by running three public services:
 
 - `frontend`: Next.js web app

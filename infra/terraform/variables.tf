@@ -52,20 +52,26 @@ variable "memory_server_generation_model" {
   default     = "gpt-4o-mini"
 }
 
+variable "memory_server_embedding_model" {
+  description = "Embedding model used by Redis Agent Memory Server."
+  type        = string
+  default     = "text-embedding-3-large"
+}
+
+variable "memory_server_vector_dimensions" {
+  description = "Vector dimensions used by RedisVL for the memory index."
+  type        = number
+  default     = 3072
+}
+
 variable "backend_cors_origins" {
   description = "Comma-separated origins allowed by FastAPI CORS. Use * for lightweight testing."
   type        = string
   default     = "*"
 }
 
-variable "ollama_url" {
-  description = "Optional Ollama endpoint. Leave empty to disable."
+variable "openai_chat_model" {
+  description = "OpenAI model used by the backend for response generation."
   type        = string
-  default     = ""
-}
-
-variable "ollama_model" {
-  description = "Optional Ollama model name."
-  type        = string
-  default     = "llama3.2"
+  default     = "gpt-4o-mini"
 }

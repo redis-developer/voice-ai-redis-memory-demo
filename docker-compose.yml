@@ -7,6 +7,8 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       REDIS_URL: ${REDIS_URL:?REDIS_URL must be set}
       GENERATION_MODEL: ${MEMORY_SERVER_GENERATION_MODEL:-gpt-4o-mini}
+      EMBEDDING_MODEL: ${MEMORY_SERVER_EMBEDDING_MODEL:-text-embedding-3-large}
+      REDISVL_VECTOR_DIMENSIONS: ${MEMORY_SERVER_VECTOR_DIMENSIONS:-3072}
     ports:
       - "8000:8000"
     healthcheck:
@@ -27,7 +29,7 @@ services:
     environment:
       MEMORY_SERVER_URL: ${MEMORY_SERVER_URL:-http://memory-server:8000}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
-      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OPENAI_CHAT_MODEL: ${OPENAI_CHAT_MODEL:-gpt-4o-mini}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

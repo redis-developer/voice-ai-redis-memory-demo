@@ -1,13 +1,12 @@
 """Memory client wrapper for Redis Agent Memory Server."""
 import os
 import logging
-import asyncio
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 from dotenv import load_dotenv
 import httpx
-import redis
 from agent_memory_client import create_memory_client
+from agent_memory_client.filters import Namespace, UserId
 from agent_memory_client.models import MemoryMessage, ClientMemoryRecord, MemoryTypeEnum
 from src.observability import now_ms, log_timing
 
@@ -24,22 +23,71 @@ class MemoryClient:
         base_url: Optional[str] = None,
         namespace: str = "voice-journal"
     ):
-        self.base_url = base_url or os.getenv("MEMORY_SERVER_URL", "http://localhost:8001")
+        resolved_base_url = base_url or os.getenv("MEMORY_SERVER_URL")
+        if not resolved_base_url:
+            raise ValueError("MEMORY_SERVER_URL must be set for Redis Agent Memory Server")
+        self.base_url = resolved_base_url
         self.namespace = namespace
         self._client = None
 
-    def _build_long_term_filters(self, user_id: Optional[str] = None) -> Dict[str, Dict[str, str]]:
-        """Build explicit long-term memory filters for Redis AMS.
-
-        AMS docs recommend filtering personal data by ``user_id`` and
-        using ``namespace`` to isolate app/domain-specific memories.
-        """
-        filters: Dict[str, Dict[str, str]] = {
-            "namespace": {"eq": self.namespace},
+    def _build_long_term_search_kwargs(self, user_id: Optional[str] = None) -> Dict[str, Any]:
+        """Build doc-supported long-term search kwargs for the AMS client."""
+        search_kwargs: Dict[str, Any] = {
+            "namespace": Namespace(eq=self.namespace),
         }
         if user_id:
-            filters["user_id"] = {"eq": user_id}
-        return filters
+            search_kwargs["user_id"] = UserId(eq=user_id)
+        return search_kwargs
+
+    @staticmethod
+    def _memory_preview(text: Optional[str], limit: int = 60) -> str:
+        """Return a compact one-line memory preview for logs."""
+        if not text:
+            return ""
+        collapsed = " ".join(text.split())
+        return collapsed[:limit]
+
+    @staticmethod
+    def _memory_distance(memory: Any) -> Optional[float]:
+        """Read the similarity distance from an SDK memory object."""
+        return getattr(memory, "dist", None)
+
+    async def _log_near_miss_candidates(
+        self,
+        client: Any,
+        query: str,
+        user_id: Optional[str],
+        limit: int,
+    ) -> None:
+        """Run a broader diagnostic search and log the nearest candidates."""
+        try:
+            diagnostic_results = await client.search_long_term_memory(
+                text=query,
+                limit=max(limit, 5),
+                distance_threshold=1.0,
+                **self._build_long_term_search_kwargs(user_id=user_id),
+            )
+            candidates = []
+            for memory in diagnostic_results.memories[:5]:
+                candidates.append({
+                    "id": memory.id,
+                    "distance": self._memory_distance(memory),
+                    "preview": self._memory_preview(memory.text),
+                })
+            logger.info(
+                "memory.search.near_misses query_chars=%s user_id=%s candidates=%s",
+                len(query),
+                user_id,
+                candidates,
+            )
+        except Exception as exc:
+            logger.warning(
+                "memory.search.near_misses_failed query_chars=%s user_id=%s error_type=%s error=%s",
+                len(query),
+                user_id,
+                type(exc).__name__,
+                exc,
+            )
     
     async def _get_client(self):
         """Get or create the memory client."""
@@ -94,15 +142,6 @@ class MemoryClient:
         start_ms = now_ms()
         client = await self._get_client()
         now = datetime.now(timezone.utc)
-        
-        # Build entry content with metadata
-        entry_metadata = {
-            "type": "journal_entry",
-            "language_code": language_code,
-            "timestamp": now.isoformat(),
-            "audio_file": audio_file,
-            **(metadata or {})
-        }
         
         # Create message
         message = MemoryMessage(
@@ -184,11 +223,7 @@ class MemoryClient:
         except Exception as e:
             logger.error(f"Error saving mood: {e}")
             log_timing("memory.save_mood", start_ms, logger_instance=logger, user_id=user_id, mood=mood, error=True)
-            return {
-                "status": "error",
-                "error": str(e),
-                "stored": False
-            }
+            raise
 
     async def create_journal_memory(
         self,
@@ -265,34 +300,19 @@ class MemoryClient:
                 session_id=session_id,
                 error=True,
             )
-            return {
-                "status": "error",
-                "error": str(e),
-                "stored_in_long_term": False
-            }
+            raise
 
-    async def add_assistant_response(
-        self,
-        session_id: str,
-        user_id: str,
-        response: str
-    ):
-        """Add an assistant response to working memory."""
-        client = await self._get_client()
-        now = datetime.now(timezone.utc)
-        
-        message = MemoryMessage(
-            role="assistant",
-            content=response,
-            created_at=now
-        )
-        
-        await client.append_messages_to_working_memory(
-            session_id=session_id,
-            messages=[message],
-            user_id=user_id
-        )
-    
+    def _format_session_transcript(self, messages: List[Dict[str, Any]]) -> str:
+        """Format a session transcript for long-term promotion."""
+        lines = []
+        for message in messages:
+            role = message.get("role", "user")
+            role_label = "User" if role == "user" else "Assistant"
+            content = (message.get("content") or "").strip()
+            if content:
+                lines.append(f"{role_label}: {content}")
+        return "\n".join(lines)
+
     async def get_session_history(
         self,
         session_id: str,
@@ -315,10 +335,56 @@ class MemoryClient:
             for msg in working_memory.messages
         ]
     
-    async def end_session(self, session_id: str):
-        """End and cleanup a session."""
+    async def promote_session_to_long_term(self, session_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+        """Promote the full working-memory transcript into long-term memory."""
+        messages = await self.get_session_history(session_id, user_id)
+        transcript = self._format_session_transcript(messages)
+        if not transcript:
+            return None
+
+        start_ms = now_ms()
         client = await self._get_client()
+        now = datetime.now(timezone.utc)
+
+        memory = ClientMemoryRecord(
+            id=f"session:{session_id}",
+            text=transcript,
+            memory_type=MemoryTypeEnum.EPISODIC,
+            user_id=user_id,
+            session_id=session_id,
+            namespace=self.namespace,
+            topics=["session", "conversation", "chat_history"],
+            created_at=now,
+        )
+
+        response = await client.create_long_term_memory(
+            memories=[memory],
+            deduplicate=True,
+        )
+        log_timing(
+            "memory.promote_session_to_long_term",
+            start_ms,
+            logger_instance=logger,
+            session_id=session_id,
+            message_count=len(messages),
+            transcript_chars=len(transcript),
+        )
+
+        return {
+            "status": response.status,
+            "memory_id": memory.id,
+            "message_count": len(messages),
+            "transcript_chars": len(transcript),
+        }
+
+    async def end_session(self, session_id: str, user_id: str, promote: bool = True):
+        """Optionally promote and then clean up a session."""
+        client = await self._get_client()
+        promotion = None
+        if promote:
+            promotion = await self.promote_session_to_long_term(session_id, user_id)
         await client.delete_working_memory(session_id)
+        return promotion
 
     async def search_long_term_memory(
         self,
@@ -346,14 +412,14 @@ class MemoryClient:
         log_timing("memory.search.client_get", t0, logger_instance=logger)
 
         try:
-            filters = self._build_long_term_filters(user_id=user_id)
+            search_kwargs = self._build_long_term_search_kwargs(user_id=user_id)
 
             t1 = now_ms()
             results = await client.search_long_term_memory(
                 text=query,
-                filters=filters,
                 limit=limit,
-                distance_threshold=distance_threshold
+                distance_threshold=distance_threshold,
+                **search_kwargs,
             )
             log_timing("memory.search.api_call", t1, logger_instance=logger, query_chars=len(query), limit=limit)
 
@@ -372,53 +438,28 @@ class MemoryClient:
                     "namespace": memory.namespace
                 })
 
+            logger.info(
+                "memory.search.results query_chars=%s user_id=%s threshold=%.2f distances=%s",
+                len(query),
+                user_id,
+                distance_threshold,
+                [memory.get("distance") for memory in memories],
+            )
+            if not memories:
+                await self._log_near_miss_candidates(
+                    client=client,
+                    query=query,
+                    user_id=user_id,
+                    limit=limit,
+                )
+
             log_timing("memory.search.total", t0, logger_instance=logger, results=len(memories), user_id=user_id)
             return memories
 
         except Exception as e:
             logger.error(f"Error searching long-term memory: {e}")
             log_timing("memory.search.total", t0, logger_instance=logger, results=0, user_id=user_id, error=True)
-            return []
-
-    async def search_memory_tool(
-        self,
-        query: str,
-        user_id: Optional[str] = None,
-        topics: Optional[List[str]] = None,
-        max_results: int = 10,
-        min_relevance: float = 0.3
-    ) -> Dict[str, Any]:
-        """
-        Simplified memory search designed for LLM tool use.
-
-        Args:
-            query: The search query
-            user_id: Optional user ID filter
-            topics: Optional list of topics to filter by
-            max_results: Maximum results to return
-            min_relevance: Minimum relevance score (0-1)
-
-        Returns:
-            Dict with 'summary', 'memories' list, and 'total'
-        """
-        client = await self._get_client()
-
-        try:
-            result = await client.search_memory_tool(
-                query=query,
-                user_id=user_id,
-                topics=topics,
-                max_results=max_results,
-                min_relevance=min_relevance
-            )
-            return result
-        except Exception as e:
-            logger.error(f"Error in search_memory_tool: {e}")
-            return {
-                "summary": f"Search failed: {e}",
-                "memories": [],
-                "total": 0
-            }
+            raise
 
     async def save_conversation_turn(
         self,
@@ -440,7 +481,7 @@ class MemoryClient:
             assistant_response: The assistant's response
 
         Returns:
-            True if saved successfully, False otherwise
+            True if saved successfully
         """
         start_ms = now_ms()
         client = await self._get_client()
@@ -472,13 +513,13 @@ class MemoryClient:
         except Exception as e:
             logger.warning(f"Working memory error saving turn: {e}")
             log_timing("memory.save_conversation_turn", start_ms, logger_instance=logger, session_id=session_id, error=True)
-            return False
+            raise
 
     async def get_conversation_context(
         self,
         session_id: str,
         user_id: str,
-        max_turns: int = 10
+        max_turns: Optional[int] = None
     ) -> str:
         """
         Get formatted conversation context from working memory for LLM prompts.
@@ -504,18 +545,21 @@ class MemoryClient:
                 session_id=session_id,
                 user_id=user_id
             )
-            log_timing("memory.working_context.api_call", t1, logger_instance=logger, session_id=session_id, max_turns=max_turns)
+            log_timing("memory.working_context.api_call", t1, logger_instance=logger, session_id=session_id, max_turns=max_turns or "all")
 
             if not working_memory.messages:
                 log_timing("memory.working_context.total", t0, logger_instance=logger, session_id=session_id, message_count=0, chars=0)
                 return ""
 
-            # Get recent messages (limit to max_turns * 2 for user+assistant pairs)
-            recent_messages = working_memory.messages[-(max_turns * 2):]
+            if max_turns is None:
+                selected_messages = working_memory.messages
+            else:
+                # Limit to max_turns * 2 for user+assistant pairs
+                selected_messages = working_memory.messages[-(max_turns * 2):]
 
             # Format as conversation history
             lines = []
-            for msg in recent_messages:
+            for msg in selected_messages:
                 role_label = "User" if msg.role == "user" else "Assistant"
                 lines.append(f"{role_label}: {msg.content}")
 
@@ -525,7 +569,7 @@ class MemoryClient:
                 t0,
                 logger_instance=logger,
                 session_id=session_id,
-                message_count=len(recent_messages),
+                message_count=len(selected_messages),
                 chars=len(context),
             )
             return context
@@ -533,65 +577,4 @@ class MemoryClient:
         except Exception as e:
             logger.warning(f"Working memory error getting context: {e}")
             log_timing("memory.working_context.total", t0, logger_instance=logger, session_id=session_id, message_count=0, chars=0, error=True)
-            return ""
-
-    async def get_combined_context(
-        self,
-        session_id: str,
-        user_id: str,
-        query: str,
-        max_conversation_turns: int = 5,
-        max_long_term_results: int = 5
-    ) -> Tuple[str, str]:
-        """
-        Get both conversation context and relevant long-term memories.
-
-        This is useful for building rich context for LLM prompts that includes
-        both the recent conversation and relevant past journal entries.
-
-        Args:
-            session_id: Unique session identifier
-            user_id: User identifier
-            query: Current query to search long-term memory
-            max_conversation_turns: Max conversation turns to include
-            max_long_term_results: Max long-term memory results
-
-        Returns:
-            Tuple of (conversation_context, long_term_context)
-        """
-        # Get conversation history from working memory
-        conversation_context = await self.get_conversation_context(
-            session_id=session_id,
-            user_id=user_id,
-            max_turns=max_conversation_turns
-        )
-
-        # Search long-term memory for relevant entries
-        memories = await self.search_long_term_memory(
-            query=query,
-            user_id=user_id,
-            limit=max_long_term_results,
-            distance_threshold=0.8
-        )
-
-        # Format long-term memories
-        long_term_lines = []
-        for memory in memories:
-            created_at = memory.get("created_at", "")
-            if created_at:
-                try:
-                    dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                    date_str = dt.strftime("%b %d")
-                except Exception:
-                    date_str = "Recent"
-            else:
-                date_str = "Recent"
-
-            text = memory.get("text", "")
-            if len(text) > 150:
-                text = text[:150] + "..."
-            long_term_lines.append(f"- {date_str}: {text}")
-
-        long_term_context = "\n".join(long_term_lines) if long_term_lines else ""
-
-        return conversation_context, long_term_context
+            raise

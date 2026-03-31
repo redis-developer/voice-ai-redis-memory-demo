@@ -70,9 +70,11 @@ resource "aws_apprunner_service" "memory_server" {
         start_command = "agent-memory api --host 0.0.0.0 --port 8000 --task-backend asyncio"
 
         runtime_environment_variables = {
-          OPENAI_API_KEY   = var.openai_api_key
-          REDIS_URL        = var.redis_url
-          GENERATION_MODEL = var.memory_server_generation_model
+          OPENAI_API_KEY            = var.openai_api_key
+          REDIS_URL                 = var.redis_url
+          GENERATION_MODEL          = var.memory_server_generation_model
+          EMBEDDING_MODEL           = var.memory_server_embedding_model
+          REDISVL_VECTOR_DIMENSIONS = tostring(var.memory_server_vector_dimensions)
         }
       }
     }
@@ -108,12 +110,11 @@ resource "aws_apprunner_service" "backend" {
         runtime_environment_variables = {
           SARVAM_API_KEY    = var.sarvam_api_key
           OPENAI_API_KEY    = var.openai_api_key
+          OPENAI_CHAT_MODEL = var.openai_chat_model
           REDIS_URL         = var.redis_url
           GOOGLE_CLIENT_ID  = var.google_client_id
           MEMORY_SERVER_URL = "https://${aws_apprunner_service.memory_server.service_url}"
           CORS_ORIGINS      = var.backend_cors_origins
-          OLLAMA_URL        = var.ollama_url
-          OLLAMA_MODEL      = var.ollama_model
         }
       }
     }

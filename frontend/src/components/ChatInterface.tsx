@@ -401,13 +401,13 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 bg-black/30 backdrop-blur-sm flex items-center justify-center z-50">
-      <div className="bg-white/90 backdrop-blur-md rounded-3xl w-full max-w-lg h-[600px] mx-4 flex flex-col shadow-2xl border border-white/50">
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/30 backdrop-blur-sm sm:items-center">
+      <div className="bg-white/90 backdrop-blur-md w-full h-[100dvh] rounded-t-3xl sm:rounded-3xl sm:max-w-lg sm:h-[600px] mx-0 sm:mx-4 flex flex-col shadow-2xl border border-white/50">
         {/* Header */}
-        <div className="p-4 border-b border-gray-200/50 flex items-center justify-between">
+        <div className="p-4 border-b border-gray-200/50 flex items-start justify-between gap-3 sm:items-center">
           <div>
             <h2 className="text-lg font-semibold text-gray-800">Voice Journal</h2>
-            <div className="flex items-center gap-2 mt-1">
+            <div className="mt-1 flex flex-wrap items-center gap-2">
               <span className={`px-2 py-0.5 text-xs rounded-full ${mode === 'chat' ? 'bg-purple-100 text-purple-700' : 'bg-green-100 text-green-700'}`}>
                 {mode === 'chat' ? 'Chat' : 'Log'} mode
               </span>
@@ -417,7 +417,7 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
           <div className="flex items-center gap-2">
             <button
               onClick={startNewChat}
-              className="px-3 py-1.5 text-xs bg-purple-100 text-purple-700 rounded-full hover:bg-purple-200 transition-colors"
+              className="hidden px-3 py-1.5 text-xs bg-purple-100 text-purple-700 rounded-full hover:bg-purple-200 transition-colors sm:inline-flex"
               title="Start a new conversation"
             >
               New Chat
@@ -434,7 +434,7 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
           {messages.map((msg) => (
             <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-[80%] rounded-2xl px-4 py-2 ${
+              <div className={`max-w-[88%] rounded-2xl px-4 py-2 sm:max-w-[80%] ${
                 msg.role === 'user'
                   ? 'bg-purple-500 text-white'
                   : 'bg-gray-100 text-gray-800'
@@ -466,7 +466,15 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
         </div>
 
         {/* Input */}
-        <div className="p-4 border-t border-gray-200/50">
+        <div className="p-4 border-t border-gray-200/50 pb-[max(1rem,env(safe-area-inset-bottom))]">
+          <div className="mb-3 sm:hidden">
+            <button
+              onClick={startNewChat}
+              className="w-full rounded-2xl bg-purple-100 px-4 py-2 text-sm font-medium text-purple-700 transition-colors hover:bg-purple-200"
+            >
+              New Chat
+            </button>
+          </div>
           <div className="flex items-center gap-2">
             <button
               onClick={isRecording ? stopRecording : startRecording}

@@ -16,6 +16,8 @@ interface SidebarProps {
   userName?: string;
   userEmail?: string;
   userAvatarUrl?: string | null;
+  isMobileOpen?: boolean;
+  onMobileClose?: () => void;
 }
 
 // Color palette for calendar events
@@ -28,7 +30,15 @@ const eventColors = [
   { border: 'border-teal-400', text: 'text-teal-600' },
 ];
 
-export default function Sidebar({ activeTab, onTabChange, userName, userEmail, userAvatarUrl }: SidebarProps) {
+export default function Sidebar({
+  activeTab,
+  onTabChange,
+  userName,
+  userEmail,
+  userAvatarUrl,
+  isMobileOpen = false,
+  onMobileClose,
+}: SidebarProps) {
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -64,10 +74,10 @@ export default function Sidebar({ activeTab, onTabChange, userName, userEmail, u
     fetchCalendarEvents();
   }, []);
 
-  return (
-    <aside className="w-64 glass-card h-screen flex flex-col border-r border-white/20">
+  const sidebarContent = (
+    <aside className="w-72 max-w-[85vw] glass-card h-full flex flex-col border-r border-white/20 shadow-2xl lg:w-64 lg:max-w-none lg:shadow-none">
       {/* Logo */}
-      <div className="p-6 border-b border-gray-200/50">
+      <div className="p-5 border-b border-gray-200/50 lg:p-6">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 bg-gradient-to-br from-violet-500 to-purple-600 rounded-xl flex items-center justify-center shadow-lg shadow-purple-500/25">
             <span className="text-xl">🎙️</span>
@@ -76,6 +86,15 @@ export default function Sidebar({ activeTab, onTabChange, userName, userEmail, u
             <h1 className="font-bold text-lg text-gray-800">Voice Journal</h1>
             <p className="text-xs text-gray-500">Your thoughts, captured</p>
           </div>
+          <button
+            onClick={onMobileClose}
+            className="ml-auto rounded-full p-2 text-gray-500 hover:bg-white/70 lg:hidden"
+            aria-label="Close menu"
+          >
+            <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
         </div>
       </div>
 
@@ -115,7 +134,10 @@ export default function Sidebar({ activeTab, onTabChange, userName, userEmail, u
           {tabs.map((tab) => (
             <button
               key={tab.id}
-              onClick={() => onTabChange(tab.id)}
+              onClick={() => {
+                onTabChange(tab.id);
+                onMobileClose?.();
+              }}
               className={`w-full flex items-center justify-between px-4 py-3 rounded-xl transition-all ${
                 activeTab === tab.id
                   ? 'bg-purple-500/20 text-purple-700 font-medium'
@@ -175,5 +197,21 @@ export default function Sidebar({ activeTab, onTabChange, userName, userEmail, u
         </div>
       </div>
     </aside>
+  );
+
+  return (
+    <>
+      <div className="hidden lg:block lg:h-screen">
+        {sidebarContent}
+      </div>
+
+      {isMobileOpen && (
+        <div className="fixed inset-0 z-40 bg-slate-900/35 backdrop-blur-sm lg:hidden">
+          <div className="h-full">
+            {sidebarContent}
+          </div>
+        </div>
+      )}
+    </>
   );
 }

@@ -16,44 +16,14 @@ import {
   type GoogleAuthProfile,
 } from '@/lib/userId';
 
-// Mock data for demonstration
-const mockEntries: JournalEntry[] = [
-  {
-    id: '1',
-    transcript: 'Today was a productive day. I managed to complete the voice journal project and learned a lot about Redis Agent Memory Server.',
-    language_code: 'en-IN',
-    created_at: new Date().toISOString(),
-    duration_seconds: 45,
-    mood: 'happy',
-    tags: ['work', 'coding'],
-  },
-  {
-    id: '2',
-    transcript: 'Had a great meeting with the team today. We discussed the roadmap for Q1 and everyone seemed excited.',
-    language_code: 'en-IN',
-    created_at: new Date(Date.now() - 3600000).toISOString(),
-    duration_seconds: 32,
-    mood: 'excited',
-    tags: ['work', 'meeting'],
-  },
-  {
-    id: '3',
-    transcript: 'Guess what? Voice journal के साथ हिंदी में journal entry करना बहुत easy है!',
-    language_code: 'hi-IN',
-    created_at: new Date(Date.now() - 86400000).toISOString(),
-    duration_seconds: 28,
-    mood: 'grateful',
-    tags: ['personal', 'hindi'],
-  },
-];
-
 export default function Home() {
   const [userId, setUserId] = useState('default_user');
   const [authUser, setAuthUser] = useState<GoogleAuthProfile | null>(null);
   const [authReady, setAuthReady] = useState(false);
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
   const [activeTab, setActiveTab] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
-  const [entries, setEntries] = useState<JournalEntry[]>(mockEntries);
+  const [entries, setEntries] = useState<JournalEntry[]>([]);
   const [isRecordingModalOpen, setIsRecordingModalOpen] = useState(false);
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [selectedMood, setSelectedMood] = useState<string | null>(null);
@@ -193,23 +163,36 @@ export default function Home() {
   };
 
   return (
-    <div className="flex h-screen gradient-bg">
+    <div className="flex min-h-screen flex-col lg:h-screen lg:flex-row gradient-bg">
       <Sidebar
         activeTab={activeTab}
         onTabChange={setActiveTab}
         userName={authUser?.name || undefined}
         userEmail={authUser?.email || undefined}
         userAvatarUrl={authUser?.picture}
+        isMobileOpen={isMobileSidebarOpen}
+        onMobileClose={() => setIsMobileSidebarOpen(false)}
       />
 
-      <main className="flex-1 flex flex-col overflow-hidden">
-        <header className="p-6 border-b border-gray-200/50">
-          <div className="flex items-center justify-between mb-6">
-            <div>
+      <main className="flex-1 flex flex-col overflow-hidden min-h-screen lg:min-h-0">
+        <header className="p-4 border-b border-gray-200/50 sm:p-6">
+          <div className="mb-6 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+            <div className="flex items-start gap-3">
+              <button
+                onClick={() => setIsMobileSidebarOpen(true)}
+                className="mt-1 inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-white/70 bg-white/80 text-gray-700 shadow-sm lg:hidden"
+                aria-label="Open menu"
+              >
+                <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+                </svg>
+              </button>
+              <div>
               <h1 className="text-2xl font-bold text-gray-800">Voice Journal</h1>
               <p className="text-sm text-gray-500">Capture your thoughts with your voice</p>
+              </div>
             </div>
-            <div className="flex flex-wrap items-center gap-3">
+            <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
               <GoogleAuthButton
                 currentUser={authUser}
                 onAuthenticated={(profile) => {
@@ -223,7 +206,7 @@ export default function Home() {
               />
               <button
                 onClick={() => setIsChatOpen(true)}
-                className="flex items-center gap-2 px-5 py-3 bg-gradient-to-r from-emerald-500 to-teal-600 rounded-xl text-white font-medium hover:from-emerald-400 hover:to-teal-500 transition-all shadow-lg shadow-teal-500/25"
+                className="flex w-full items-center justify-center gap-2 px-5 py-3 bg-gradient-to-r from-emerald-500 to-teal-600 rounded-xl text-white font-medium hover:from-emerald-400 hover:to-teal-500 transition-all shadow-lg shadow-teal-500/25 sm:w-auto"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
@@ -232,7 +215,7 @@ export default function Home() {
               </button>
               <button
                 onClick={() => setIsRecordingModalOpen(true)}
-                className="flex items-center gap-2 px-5 py-3 bg-gradient-to-r from-violet-500 to-purple-600 rounded-xl text-white font-medium hover:from-violet-400 hover:to-purple-500 transition-all shadow-lg shadow-purple-500/25"
+                className="flex w-full items-center justify-center gap-2 px-5 py-3 bg-gradient-to-r from-violet-500 to-purple-600 rounded-xl text-white font-medium hover:from-violet-400 hover:to-purple-500 transition-all shadow-lg shadow-purple-500/25 sm:w-auto"
               >
                 <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
                   <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
@@ -244,7 +227,7 @@ export default function Home() {
 
           <div className="mb-6">
             <p className="text-sm text-gray-600 mb-3">How are you feeling today?</p>
-            <div className="flex gap-3">
+            <div className="-mx-1 flex gap-3 overflow-x-auto px-1 pb-2">
               {[
                 { emoji: '😊', label: 'Happy', color: 'bg-yellow-100 hover:bg-yellow-200 border-yellow-300', selectedColor: 'bg-yellow-300 border-yellow-500 ring-2 ring-yellow-400' },
                 { emoji: '😢', label: 'Sad', color: 'bg-blue-100 hover:bg-blue-200 border-blue-300', selectedColor: 'bg-blue-300 border-blue-500 ring-2 ring-blue-400' },
@@ -257,7 +240,7 @@ export default function Home() {
                   key={mood.label}
                   onClick={() => handleMoodSelect(mood.label, mood.emoji)}
                   disabled={moodSaving}
-                  className={`flex flex-col items-center px-4 py-3 rounded-xl border transition-all ${
+                  className={`min-w-24 shrink-0 flex flex-col items-center px-4 py-3 rounded-xl border transition-all ${
                     selectedMood === mood.label ? mood.selectedColor : mood.color
                   } ${moodSaving ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
                 >
@@ -271,7 +254,7 @@ export default function Home() {
           <SearchBar value={searchQuery} onChange={setSearchQuery} />
         </header>
 
-        <div className="flex-1 overflow-y-auto p-6">
+        <div className="flex-1 overflow-y-auto p-4 sm:p-6">
           <div className="space-y-3">
             {filteredEntries.length > 0 ? (
               filteredEntries.map((entry, index) => (

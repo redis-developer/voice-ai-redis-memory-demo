@@ -36,7 +36,14 @@ from src.analytics import JournalAnalytics
 from src.memory_client import MemoryClient
 from src.voice_agent import VoiceJournalAgent
 from src.calendar_client import CalendarClient
-from src.observability import now_ms, log_timing, set_request_context, reset_request_context, update_request_context
+from src.observability import (
+    now_ms,
+    log_timing,
+    set_request_context,
+    reset_request_context,
+    update_request_context,
+    get_request_context,
+)
 
 # Global clients
 memory_client: Optional[MemoryClient] = None
@@ -52,10 +59,9 @@ async def lifespan(app: FastAPI):
 
     # Check memory server health
     is_healthy = await memory_client.health_check()
-    if is_healthy:
-        logger.info("Connected to Redis Agent Memory Server")
-    else:
-        logger.warning("Redis Agent Memory Server not available - memory features disabled")
+    if not is_healthy:
+        raise RuntimeError(f"Redis Agent Memory Server is unavailable at {memory_client.base_url}")
+    logger.info("Connected to Redis Agent Memory Server")
 
     yield
     # Cleanup
@@ -246,7 +252,13 @@ async def google_auth(request: GoogleAuthRequestBody):
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint."""
-    memory_healthy = await memory_client.health_check() if memory_client else False
+    if not memory_client:
+        raise HTTPException(status_code=503, detail="Redis Agent Memory Server client is not initialized")
+
+    memory_healthy = await memory_client.health_check()
+    if not memory_healthy:
+        raise HTTPException(status_code=503, detail="Redis Agent Memory Server is unavailable")
+
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
@@ -325,20 +337,20 @@ async def transcribe_audio(
 
         # Store in Redis Agent Memory Server (long-term memory for retrieval)
         memory_entry = None
-        if payload.store_in_memory and memory_client:
-            try:
-                memory_start_ms = now_ms()
-                memory_entry = await memory_client.create_journal_memory(
-                    user_id=user_id,
-                    transcript=transcript,
-                    language_code=language_code,
-                    topics=["journal", "voice_entry"],
-                    session_id=session_id
-                )
-                timings_ms["memory_write"] = log_timing("api.transcribe.memory_write", memory_start_ms, logger_instance=logger)
-                logger.info(f"Stored voice entry in long-term memory: {memory_entry.get('memory_id', 'unknown')}")
-            except Exception as mem_err:
-                logger.warning(f"Failed to store in memory: {mem_err}")
+        if payload.store_in_memory:
+            if not memory_client:
+                raise HTTPException(status_code=503, detail="Redis Agent Memory Server client is not initialized")
+
+            memory_start_ms = now_ms()
+            memory_entry = await memory_client.create_journal_memory(
+                user_id=user_id,
+                transcript=transcript,
+                language_code=language_code,
+                topics=["journal", "voice_entry"],
+                session_id=session_id
+            )
+            timings_ms["memory_write"] = log_timing("api.transcribe.memory_write", memory_start_ms, logger_instance=logger)
+            logger.info(f"Stored voice entry in long-term memory: {memory_entry.get('memory_id', 'unknown')}")
 
         timings_ms["total"] = log_timing("api.transcribe.total", total_start_ms, logger_instance=logger)
 
@@ -395,23 +407,22 @@ async def create_entry(entry: EntryCreate, auth_user: Dict[str, str] = Depends(g
     session_id = entry.session_id or str(uuid.uuid4())
 
     # Store in Redis Agent Memory Server
-    if memory_client:
-        try:
-            await memory_client.add_journal_entry(
-                session_id=session_id,
-                user_id=user_id,
-                transcript=entry.transcript,
-                language_code=entry.language_code,
-                metadata={
-                    "mood": entry.mood,
-                    "tags": entry.tags,
-                    "duration_seconds": entry.duration_seconds,
-                    "source": "manual_entry"
-                }
-            )
-            logger.info(f"Stored entry in memory: {session_id}")
-        except Exception as mem_err:
-            logger.warning(f"Failed to store in memory: {mem_err}")
+    if not memory_client:
+        raise HTTPException(status_code=503, detail="Redis Agent Memory Server client is not initialized")
+
+    await memory_client.add_journal_entry(
+        session_id=session_id,
+        user_id=user_id,
+        transcript=entry.transcript,
+        language_code=entry.language_code,
+        metadata={
+            "mood": entry.mood,
+            "tags": entry.tags,
+            "duration_seconds": entry.duration_seconds,
+            "source": "manual_entry"
+        }
+    )
+    logger.info(f"Stored entry in memory: {session_id}")
 
     # Also store in journal manager for local persistence
     new_entry = journal_manager.create_entry(
@@ -445,8 +456,13 @@ async def end_session(session_id: str, auth_user: Dict[str, str] = Depends(get_a
         raise HTTPException(status_code=503, detail="Memory server not available")
 
     try:
-        await memory_client.get_session_history(session_id, auth_user["user_id"])
-        return {"status": "session_verified", "session_id": session_id}
+        promotion = await memory_client.end_session(session_id, auth_user["user_id"], promote=True)
+        return {
+            "status": "session_ended",
+            "session_id": session_id,
+            "promoted_to_long_term": bool(promotion),
+            "promotion": promotion,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -555,10 +571,11 @@ def get_request_id(http_request: Request) -> str:
 
 def get_or_create_agent(user_id: str, session_id: str) -> VoiceJournalAgent:
     """Get or create an agent for a user and session."""
+    if not memory_client:
+        raise RuntimeError("Redis Agent Memory Server client is not initialized")
+
     agent_key = f"{user_id}:{session_id}"
     if agent_key not in agents:
-        # Pass memory_client for searching long-term memory (memory_idx)
-        # Pass session_id for working memory (conversation continuity)
         agents[agent_key] = VoiceJournalAgent(
             user_id=user_id,
             session_id=session_id,
@@ -750,6 +767,7 @@ async def agent_chat_stream(
         user_id=user_id,
         session_id=session_id,
     )
+    request_context = get_request_context()
 
     # If audio provided, transcribe first (same as non-streaming endpoint)
     if payload.audio_base64 and not text:
@@ -794,6 +812,7 @@ async def agent_chat_stream(
 
     async def generate_stream():
         """Generator that yields JSON metadata then audio chunks."""
+        stream_token = set_request_context(**request_context)
         try:
             # First, yield JSON metadata as a line
             metadata = {
@@ -844,7 +863,9 @@ async def agent_chat_stream(
                     ),
                 },
             }).encode() + b"\n"
-            reset_request_context(token)
+            reset_request_context(stream_token)
+
+    reset_request_context(token)
 
     return StreamingResponse(
         generate_stream(),

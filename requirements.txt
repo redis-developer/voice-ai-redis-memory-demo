@@ -8,11 +8,12 @@ httpx>=0.25.0
 requests>=2.31.0
 pydantic>=2.0.0
 python-dotenv>=1.0.0
+openai>=1.13.0
 
 # Redis & memory management
 redis>=5.0.0
 redisvl>=0.2.0
-agent-memory-client>=0.14.0
+agent-memory-client==0.14.0
 numpy>=1.26.0
 
 # Sarvam AI + audio
